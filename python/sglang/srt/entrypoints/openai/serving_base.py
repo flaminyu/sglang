@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import orjson
 from fastapi import HTTPException, Request
@@ -145,6 +145,27 @@ class OpenAIServingBase(ABC):
             return rid
 
         return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
+
+    def _build_streaming_input_chunk_ack_response(
+        self,
+        request: OpenAIServingRequest,
+        meta_info: Dict[str, Any],
+    ) -> ORJSONResponse:
+        """Return a lightweight acknowledgement for streaming-input chunks."""
+
+        payload = {
+            "id": meta_info.get("id"),
+            "object": "streaming_input.chunk_ack",
+            "created": int(time.time()),
+            "model": getattr(request, "model", None),
+            "streaming_input_chunk": True,
+        }
+
+        streaming_id = getattr(request, "streaming_input_id", None)
+        if streaming_id:
+            payload["streaming_input_id"] = streaming_id
+
+        return ORJSONResponse(content=payload)
 
     def _compute_extra_key(self, request: OpenAIServingRequest) -> Optional[str]:
         """Compute the final extra_key by concatenating cache_salt and extra_key if both are provided."""

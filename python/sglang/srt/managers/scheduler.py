@@ -72,6 +72,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
+    ChunkAckOutput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     ExpertDistributionReq,
@@ -421,6 +422,7 @@ class Scheduler(
 
         # Init running status
         self.waiting_queue: List[Req] = []
+        self.waiting_chunk_reqs: Dict[str, Req] = {}
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -1148,6 +1150,184 @@ class Scheduler(
                 else:
                     self.send_to_tokenizer.send_output(output, recv_req)
 
+    def _pin_streaming_chunk_tokens(self, req: Req):
+        """Keep KV cache pages resident between streaming chunks."""
+
+        if req.req_pool_idx is None:
+            return
+
+        # Release any existing radix-node locks because we won't keep this chunk in the tree.
+        if req.last_node is not None and hasattr(self, "tree_cache") and self.tree_cache:
+            self.tree_cache.dec_lock_ref(req.last_node)
+        req.last_node = None
+        req.last_host_node = None
+        req.cache_protected_len = 0
+
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(req.fill_ids)
+        ]
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        req.cache_protected_len = len(req.prefix_indices)
+        req.streaming_has_pinned_prefix = True
+
+        # Release the req_to_token_pool slot now that prefix indices are copied.
+        self.req_to_token_pool.free(req.req_pool_idx)
+        req.req_pool_idx = None
+
+    def _free_streaming_chunk_tokens(self, req: Req):
+        """Free pinned KV pages if a streaming chunk never receives more input."""
+
+        if (
+            self.token_to_kv_pool_allocator is None
+            or not isinstance(req.prefix_indices, torch.Tensor)
+        ):
+            return
+
+        valid_len = min(req.cache_protected_len, req.prefix_indices.numel())
+        if valid_len <= 0:
+            return
+
+        self.token_to_kv_pool_allocator.free(req.prefix_indices[:valid_len])
+        req.cache_protected_len = 0
+        req.streaming_has_pinned_prefix = False
+
+    def _apply_streaming_trim(self, req: Req, trim_len: int):
+        if not trim_len:
+            return
+
+        if trim_len < 0:
+            raise ValueError(f"streaming_trim_len must be non-negative, got {trim_len}")
+        if trim_len > len(req.origin_input_ids):
+            raise ValueError(
+                f"streaming_trim_len {trim_len} exceeds prompt length {len(req.origin_input_ids)}"
+            )
+
+        del req.origin_input_ids[-trim_len:]
+        if req.origin_input_ids_unpadded is not req.origin_input_ids:
+            del req.origin_input_ids_unpadded[-trim_len:]
+
+        if isinstance(req.prefix_indices, torch.Tensor) and req.prefix_indices.numel():
+            trim_kv = min(trim_len, req.prefix_indices.numel())
+            tail_indices = req.prefix_indices[-trim_kv:]
+            if self.token_to_kv_pool_allocator is not None and trim_kv > 0:
+                self.token_to_kv_pool_allocator.free(tail_indices)
+            req.prefix_indices = req.prefix_indices[:-trim_kv]
+            req.cache_protected_len = len(req.prefix_indices)
+
+            if req.req_pool_idx is not None and trim_kv > 0:
+                zero_slice = torch.zeros(
+                    trim_kv,
+                    dtype=self.req_to_token_pool.req_to_token.dtype,
+                    device=self.req_to_token_pool.req_to_token.device,
+                )
+                start = len(req.prefix_indices)
+                self.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(start, start + trim_kv)), zero_slice
+                )
+
+        req.fill_ids = req.origin_input_ids + req.output_ids
+        req.start_send_idx = min(req.start_send_idx, len(req.prefix_indices))
+        if req.tmp_end_idx != -1:
+            req.tmp_end_idx = min(req.tmp_end_idx, len(req.prefix_indices))
+
+    def _should_buffer_streaming_chunk(self, req: Req) -> bool:
+        return (
+            req.is_streaming_input
+            and req.waiting_for_next_chunk
+            and req.is_in_scheduler
+        )
+
+    def _buffer_inflight_streaming_chunk(
+        self,
+        key: str,
+        req: Req,
+        new_req: Req,
+        streaming_trim_len: int,
+        streaming_total_input_len: Optional[int],
+        is_last_chunk: bool,
+        recv_req: TokenizedGenerateReqInput,
+    ):
+        chunk_info = {
+            "input_ids": new_req.origin_input_ids,
+            "input_ids_unpadded": (
+                new_req.origin_input_ids_unpadded
+                if new_req.origin_input_ids_unpadded is not new_req.origin_input_ids
+                else None
+            ),
+            "multimodal_inputs": new_req.multimodal_inputs,
+            "streaming_trim_len": streaming_trim_len,
+            "streaming_total_input_len": streaming_total_input_len,
+            "logprob_start_len": recv_req.logprob_start_len,
+            "return_logprob": recv_req.return_logprob,
+            "is_last_chunk": is_last_chunk,
+        }
+        req.streaming_buffer.append(chunk_info)
+        req.sampling_params = new_req.sampling_params
+
+        if is_last_chunk:
+            return None
+        return ChunkAckOutput(rids=[req.rid])
+
+    def _flush_streaming_buffer(self, req: Req) -> bool:
+        if not req.streaming_buffer:
+            return False
+
+        for chunk in req.streaming_buffer:
+            trim_len = chunk.get("streaming_trim_len", 0) or 0
+            if trim_len:
+                self._apply_streaming_trim(req, trim_len)
+
+            req.origin_input_ids += chunk["input_ids"]
+            if (
+                req.origin_input_ids_unpadded is not req.origin_input_ids
+                and chunk.get("input_ids_unpadded") is not None
+            ):
+                req.origin_input_ids_unpadded += chunk["input_ids_unpadded"]
+
+            multimodal_inputs = chunk.get("multimodal_inputs")
+            if multimodal_inputs is not None:
+                req.extend_image_inputs(multimodal_inputs)
+
+            total_len = chunk.get("streaming_total_input_len")
+            if total_len is not None and len(req.origin_input_ids) != total_len:
+                raise ValueError(
+                    f"Streaming prompt length mismatch: expected {total_len}, got {len(req.origin_input_ids)}"
+                )
+
+            logprob_start_len = chunk.get("logprob_start_len")
+            return_logprob = chunk.get("return_logprob", False)
+            if logprob_start_len == -1 or not return_logprob:
+                if req.is_prefill_only:
+                    req.logprob_start_len = len(req.origin_input_ids)
+                else:
+                    req.logprob_start_len = len(req.origin_input_ids) - 1
+            elif logprob_start_len is not None:
+                req.logprob_start_len = logprob_start_len
+
+            if chunk.get("is_last_chunk"):
+                req.waiting_for_next_chunk = False
+                req.is_last_chunk = True
+            else:
+                req.waiting_for_next_chunk = True
+
+        req.streaming_buffer.clear()
+
+        error_msg = validate_input_length(
+            req,
+            self.max_req_input_len,
+            self.server_args.allow_auto_truncate,
+        )
+        if error_msg:
+            raise ValueError(error_msg)
+
+        self.init_req_max_new_tokens(req)
+        req.streaming_pending_chunk = True
+        if not req.waiting_for_next_chunk:
+            key = req.streaming_input_id if req.streaming_input_id else req.rid
+            self.waiting_chunk_reqs.pop(key, None)
+        return True
+
+
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
             (
@@ -1276,6 +1456,13 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            # Handle streaming input optimization
+            if getattr(recv_req, "is_streaming_input", False):
+                req.is_streaming_input = True
+                req.is_last_chunk = recv_req.is_last_chunk
+                req.streaming_input_id = recv_req.streaming_input_id
+                req.waiting_for_next_chunk = not req.is_last_chunk
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if recv_req.bootstrap_room is None:
@@ -1356,6 +1543,98 @@ class Scheduler(
         else:
             req.logprob_start_len = recv_req.logprob_start_len
 
+        # Handle streaming input
+        is_streaming = getattr(recv_req, "is_streaming_input", False)
+        is_last_chunk = getattr(recv_req, "is_last_chunk", False)
+        streaming_id = getattr(recv_req, "streaming_input_id", None)
+        streaming_trim_len = getattr(recv_req, "streaming_trim_len", 0) or 0
+        streaming_total_input_len = getattr(
+            recv_req, "streaming_total_input_len", None
+        )
+        key = streaming_id if streaming_id else req.rid
+
+        if key in self.waiting_chunk_reqs:
+            old_req = self.waiting_chunk_reqs[key]
+            old_req.rid = recv_req.rid
+
+            if is_streaming and self._should_buffer_streaming_chunk(old_req):
+                return self._buffer_inflight_streaming_chunk(
+                    key,
+                    old_req,
+                    req,
+                    streaming_trim_len,
+                    streaming_total_input_len,
+                    is_last_chunk,
+                    recv_req,
+                )
+            self._apply_streaming_trim(old_req, streaming_trim_len)
+
+            old_req.origin_input_ids += req.origin_input_ids
+            if (
+                old_req.origin_input_ids_unpadded is not old_req.origin_input_ids
+                and req.origin_input_ids_unpadded is not None
+            ):
+                old_req.origin_input_ids_unpadded += req.origin_input_ids_unpadded
+
+            if req.multimodal_inputs is not None:
+                old_req.extend_image_inputs(req.multimodal_inputs)
+
+            old_req.sampling_params = req.sampling_params
+
+            # Update logprob_start_len
+            if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
+                if old_req.is_prefill_only:
+                    old_req.logprob_start_len = len(old_req.origin_input_ids)
+                else:
+                    old_req.logprob_start_len = len(old_req.origin_input_ids) - 1
+            else:
+                old_req.logprob_start_len = recv_req.logprob_start_len
+
+            if (
+                streaming_total_input_len is not None
+                and len(old_req.origin_input_ids) != streaming_total_input_len
+            ):
+                error_msg = (
+                    f"Streaming prompt length mismatch: expected {streaming_total_input_len}, "
+                    f"got {len(old_req.origin_input_ids)}"
+                )
+                del self.waiting_chunk_reqs[key]
+                old_req.waiting_for_next_chunk = False
+                old_req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(old_req)
+                self._add_request_to_queue(old_req)
+                return
+
+            req = old_req
+
+            error_msg = validate_input_length(
+                req,
+                self.max_req_input_len,
+                self.server_args.allow_auto_truncate,
+            )
+            if error_msg:
+                del self.waiting_chunk_reqs[key]
+                req.waiting_for_next_chunk = False
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
+            self.init_req_max_new_tokens(req)
+
+            if is_last_chunk or not is_streaming:
+                del self.waiting_chunk_reqs[key]
+                req.waiting_for_next_chunk = False
+            else:
+                req.waiting_for_next_chunk = True
+
+            if req.is_in_scheduler:
+                req.streaming_pending_chunk = True
+        else:
+            if is_streaming and not is_last_chunk:
+                self.waiting_chunk_reqs[key] = req
+                req.waiting_for_next_chunk = True
+
         if not req.is_prefill_only and req.logprob_start_len >= len(
             req.origin_input_ids
         ):
@@ -1398,9 +1677,16 @@ class Scheduler(
                         req.set_finish_with_abort(error_msg)
 
         if add_to_grammar_queue:
-            self.grammar_queue.append(req)
+            if not req.is_in_scheduler:
+                self.grammar_queue.append(req)
+                req.is_in_scheduler = True
         else:
-            self._add_request_to_queue(req)
+            if not req.is_in_scheduler:
+                self._add_request_to_queue(req)
+                # req.is_in_scheduler = True # _add_request_to_queue already sets this
+
+        if req.waiting_for_next_chunk:
+            return ChunkAckOutput(rids=[req.rid])
 
     def handle_batch_generate_request(
         self,
@@ -1437,6 +1723,10 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if req.is_in_scheduler and not is_retracted:
+            return
+        req.is_in_scheduler = True
+
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
@@ -1588,6 +1878,38 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
+    def _on_streaming_chunk_prefill_done(self, req: Req):
+        if req.is_streaming_input and req.waiting_for_next_chunk:
+            # Keep the chunk's KV pages resident for the next streaming chunk
+            # without inserting into the radix cache.
+            self._pin_streaming_chunk_tokens(req)
+            req.is_in_scheduler = False
+        else:
+            self.tree_cache.cache_unfinished_req(req)
+            req.is_in_scheduler = False
+            req.streaming_has_pinned_prefix = False
+            # Free the memory pool index for the chunked request
+            if req.req_pool_idx is not None:
+                self.req_to_token_pool.free(req.req_pool_idx)
+                req.req_pool_idx = None
+
+        if req.streaming_buffer:
+            try:
+                self._flush_streaming_buffer(req)
+            except ValueError as err:
+                key = req.streaming_input_id if req.streaming_input_id else req.rid
+                self.waiting_chunk_reqs.pop(key, None)
+                req.waiting_for_next_chunk = False
+                req.set_finish_with_abort(str(err))
+                self._add_request_to_queue(req)
+                return
+
+        # If there is a pending chunk (arrived while this chunk was running),
+        # reschedule the request now.
+        if getattr(req, "streaming_pending_chunk", False):
+            req.streaming_pending_chunk = False
+            self._add_request_to_queue(req)
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
@@ -1608,6 +1930,15 @@ class Scheduler(
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
                 chunked_req_to_exclude.add(self.last_batch.chunked_req)
+
+            # Filter out streaming chunks that are waiting for more input
+            for req in self.last_batch.reqs:
+                if req.waiting_for_next_chunk:
+                    chunked_req_to_exclude.add(req)
+                    req.is_in_scheduler = False
+                    if len(req.origin_input_ids) > len(req.fill_ids):
+                        self._add_request_to_queue(req)
+                        req.is_in_scheduler = True
 
             # Filter batch
             last_bs = self.last_batch.batch_size()
@@ -2402,6 +2733,23 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+
+        # Abort streaming requests that are waiting for the next chunk
+        if self.waiting_chunk_reqs:
+            keys_to_remove = []
+            for key, req in self.waiting_chunk_reqs.items():
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    logger.debug(
+                        "Abort waiting streaming chunk request. %s", req.rid
+                    )
+                    self._free_streaming_chunk_tokens(req)
+                    req.waiting_for_next_chunk = False
+                    req.streaming_pending_chunk = False
+                    keys_to_remove.append(key)
+                    self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+
+            for key in keys_to_remove:
+                self.waiting_chunk_reqs.pop(key, None)
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:

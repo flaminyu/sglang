@@ -123,6 +123,7 @@ from sglang.srt.utils import (
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
+from sglang.srt.utils.common import is_valid_ipv6_address
 from sglang.srt.warmup import execute_warmups
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -143,6 +144,73 @@ class _GlobalState:
 
 
 _global_state: Optional[_GlobalState] = None
+
+
+@dataclasses.dataclass
+class _NativeStreamingState:
+    text: Optional[str]
+    model_path: Optional[str]
+
+
+_native_streaming_states: Dict[str, _NativeStreamingState] = {}
+_native_streaming_lock = asyncio.Lock()
+
+
+async def _prepare_native_streaming_delta(obj: GenerateReqInput) -> None:
+    """Rebuild the full prompt for native streaming delta chunks (text-only)."""
+
+    if not obj.streaming_input_id:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="streaming_input_id must be provided when streaming_payload_is_delta is true.",
+        )
+
+    if obj.text is None:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="streaming_payload_is_delta currently requires the 'text' field to carry chunk data.",
+        )
+
+    if not isinstance(obj.text, str):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="streaming_payload_is_delta only supports single-string prompts (no batching).",
+        )
+
+    chunk_text = obj.text
+
+    async with _native_streaming_lock:
+        state = _native_streaming_states.get(obj.streaming_input_id)
+        if state is None:
+            aggregated_text = chunk_text
+        else:
+            if (
+                state.model_path
+                and _global_state
+                and state.model_path != _global_state.tokenizer_manager.model_path
+            ):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    detail=(
+                        "streaming_input_id cannot be reused across different models."
+                    ),
+                )
+            aggregated_text = (state.text or "") + chunk_text
+
+        obj.text = aggregated_text
+
+        if obj.is_last_chunk:
+            _native_streaming_states.pop(obj.streaming_input_id, None)
+        else:
+            model_path = (
+                _global_state.tokenizer_manager.model_path
+                if _global_state
+                else None
+            )
+            _native_streaming_states[obj.streaming_input_id] = _NativeStreamingState(
+                text=aggregated_text,
+                model_path=model_path,
+            )
 
 
 def set_global_state(global_state: _GlobalState):
@@ -571,6 +639,10 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+
+    if obj.is_streaming_input and obj.streaming_payload_is_delta:
+        await _prepare_native_streaming_delta(obj)
+
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -1455,16 +1527,26 @@ def _execute_server_warmup(
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
 ):
     headers = {}
-    url = server_args.url()
+    host_for_warmup = server_args.host
+    if host_for_warmup in {"0.0.0.0", "::"}:
+        host_for_warmup = "127.0.0.1" if host_for_warmup == "0.0.0.0" else "::1"
+    url = (
+        f"http://[{host_for_warmup}]:{server_args.port}"
+        if is_valid_ipv6_address(host_for_warmup)
+        else f"http://{host_for_warmup}:{server_args.port}"
+    )
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
+
+    session = requests.Session()
+    session.trust_env = False
 
     # Wait until the server is launched
     success = False
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            res = session.get(url + "/get_model_info", timeout=5, headers=headers)
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break

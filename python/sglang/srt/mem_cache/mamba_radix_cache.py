@@ -467,7 +467,8 @@ class MambaRadixCache(BasePrefixCache):
 
         if req.req_pool_idx is not None:
             self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=mamba_exist)
-            self.dec_lock_ref(req.last_node)
+            if req.last_node is not None:
+                self.dec_lock_ref(req.last_node)
         else:  # for abort case
             self.req_to_token_pool.mamba_pool.free(mamba_value)
 
@@ -536,7 +537,8 @@ class MambaRadixCache(BasePrefixCache):
             new_indices[len(req.prefix_indices) :],
         )
 
-        self.dec_lock_ref(req.last_node)
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later

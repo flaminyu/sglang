@@ -405,7 +405,8 @@ class RadixCache(BasePrefixCache):
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
-        self.dec_lock_ref(req.last_node)
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
@@ -454,7 +455,8 @@ class RadixCache(BasePrefixCache):
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
         req.cache_protected_len = len(new_indices)
 
-        self.dec_lock_ref(req.last_node)
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later

@@ -106,6 +106,42 @@ class SchedulerOutputProcessorMixin:
                     # decode req in mixed batch or retracted req
                     continue
 
+                if req.is_streaming_input:
+                    req.streaming_prefill_inflight = False
+
+                if req.is_streaming_input and req.waiting_for_next_chunk:
+                    skip_stream_req = req
+
+                    if batch.return_logprob:
+                        assert extend_logprob_start_len_per_req is not None
+                        assert extend_input_len_per_req is not None
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                        extend_input_len = extend_input_len_per_req[i]
+
+                        if extend_logprob_start_len < extend_input_len:
+                            num_input_logprobs = self._calculate_num_input_logprobs(
+                                req, extend_input_len, extend_logprob_start_len
+                            )
+                            if req.return_logprob:
+                                self.add_input_logprob_return_values(
+                                    i,
+                                    req,
+                                    logits_output,
+                                    logprob_pt,
+                                    num_input_logprobs,
+                                    last_prefill_chunk=False,
+                                )
+                            logprob_pt += num_input_logprobs
+
+                    self._on_streaming_chunk_prefill_done(req)
+
+                    trace_slice(
+                        RequestStage.PREFILL_CHUNKED_FORWARD,
+                        req.rid,
+                        auto_next_anon=True,
+                    )
+                    continue
+
                 if req.is_chunked <= 0:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)

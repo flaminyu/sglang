@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -44,6 +45,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        self._streaming_completion_states: Dict[str, Dict[str, Any]] = {}
+        self._streaming_completion_lock = threading.Lock()
 
     def _request_id_prefix(self) -> str:
         return "cmpl-"
@@ -68,6 +71,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 "Echo is not compatible with logprobs. "
                 "To compute logprobs of input prompt, please use the native /generate API."
             )
+        if request.is_streaming_input:
+            self._prepare_streaming_completion_request(request)
         # Process prompt
         prompt = request.prompt
         if self.template_manager.completion_template_name is not None:
@@ -122,9 +127,57 @@ class OpenAIServingCompletion(OpenAIServingBase):
             priority=request.priority,
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            # For streaming input optimization
+            is_streaming_input=request.is_streaming_input,
+            is_last_chunk=request.is_last_chunk,
+            streaming_input_id=request.streaming_input_id,
         )
 
         return adapted_request, request
+
+    def _prepare_streaming_completion_request(
+        self, request: CompletionRequest
+    ) -> None:
+        streaming_id = request.streaming_input_id
+        if not streaming_id:
+            raise ValueError(
+                "streaming_input_id must be provided when is_streaming_input is true."
+            )
+
+        prompt_value: Union[str, List[int]] = request.prompt
+        if isinstance(prompt_value, list):
+            if len(prompt_value) != 1 or not isinstance(prompt_value[0], str):
+                raise ValueError(
+                    "Streaming input currently supports a single text prompt per chunk."
+                )
+            prompt_value = prompt_value[0]
+
+        if not isinstance(prompt_value, str):
+            raise ValueError(
+                "Streaming input currently supports text prompts for the completions API."
+            )
+
+        with self._streaming_completion_lock:
+            state = self._streaming_completion_states.get(streaming_id)
+            if state is None:
+                if not request.is_last_chunk:
+                    self._streaming_completion_states[streaming_id] = {
+                        "prompt": prompt_value,
+                        "model": request.model,
+                    }
+                request.prompt = prompt_value
+                return
+
+            if state["model"] != request.model:
+                raise ValueError(
+                    "The same streaming_input_id cannot be reused across different models."
+                )
+
+            state["prompt"] += prompt_value
+            request.prompt = state["prompt"]
+
+            if request.is_last_chunk:
+                del self._streaming_completion_states[streaming_id]
 
     def _build_sampling_params(self, request: CompletionRequest) -> Dict[str, Any]:
         """Build sampling parameters for the request"""
@@ -350,6 +403,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         if not isinstance(ret, list):
             ret = [ret]
+
+        if ret and ret[0].get("meta_info", {}).get("is_streaming_input_chunk"):
+            return self._build_streaming_input_chunk_ack_response(
+                request, ret[0]["meta_info"]
+            )
 
         response = self._build_completion_response(
             request,

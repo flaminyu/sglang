@@ -186,7 +186,8 @@ class RadixCacheCpp(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_overall_len:])
 
         # Remove req slot release the cache lock
-        self.dec_lock_ref(req.last_node)
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
         self.req_to_token_pool.free(req.req_pool_idx)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
@@ -226,7 +227,8 @@ class RadixCacheCpp(BasePrefixCache):
             ] = reused_indices
 
         if req.last_node != new_last_node:
-            self.dec_lock_ref(req.last_node)
+            if req.last_node is not None:
+                self.dec_lock_ref(req.last_node)
             self.inc_lock_ref(new_last_node)
 
         # NOTE: there might be unaligned tail, so we may need to append it

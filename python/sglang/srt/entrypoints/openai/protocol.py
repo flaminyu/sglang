@@ -269,6 +269,11 @@ class CompletionRequest(BaseModel):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
+    # For streaming input optimization
+    is_streaming_input: bool = False
+    is_last_chunk: bool = False
+    streaming_input_id: Optional[str] = None
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -529,6 +534,11 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For streaming input optimization
+    is_streaming_input: bool = False
+    is_last_chunk: bool = False
+    streaming_input_id: Optional[str] = None
 
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {

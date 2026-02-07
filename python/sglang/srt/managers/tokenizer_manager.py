@@ -52,6 +52,7 @@ from sglang.srt.managers.io_struct import (
     BatchMultimodalOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    ChunkAckOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
@@ -339,6 +340,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
+        # Streaming prompt state: streaming_input_id -> last full token ids
+        self.streaming_prompt_states: Dict[str, List[int]] = {}
 
         # Weight updates
         # The event to notify the weight sync is finished.
@@ -408,6 +411,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         BatchEmbeddingOutput,
                         BatchTokenIDOutput,
                         BatchMultimodalOutput,
+                        ChunkAckOutput,
                     ),
                     self._handle_batch_output,
                 ),
@@ -876,6 +880,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                is_streaming_input=obj.is_streaming_input,
+                is_last_chunk=obj.is_last_chunk,
+                streaming_input_id=obj.streaming_input_id,
+                streaming_trim_len=obj.streaming_trim_len or 0,
+                streaming_total_input_len=obj.streaming_total_input_len,
+                streaming_payload_is_delta=obj.streaming_payload_is_delta,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -890,7 +900,55 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 http_worker_ipc=obj.http_worker_ipc,
             )
 
+        self._prepare_streaming_prompt_delta(tokenized_obj, input_ids)
         return tokenized_obj
+
+    def _prepare_streaming_prompt_delta(
+        self,
+        tokenized_obj: TokenizedGenerateReqInput,
+        full_input_ids: List[int],
+    ) -> None:
+        if not isinstance(tokenized_obj, TokenizedGenerateReqInput):
+            return
+
+        total_len = len(full_input_ids) if full_input_ids is not None else 0
+        tokenized_obj.streaming_total_input_len = total_len
+
+        if not tokenized_obj.is_streaming_input:
+            return
+
+        streaming_id = tokenized_obj.streaming_input_id
+        if streaming_id is None:
+            raise ValueError(
+                "streaming_input_id must be provided when is_streaming_input is true."
+            )
+        if not isinstance(full_input_ids, list):
+            raise ValueError(
+                "Streaming input currently supports single prompt inputs per chunk."
+            )
+
+        prev_ids = self.streaming_prompt_states.get(streaming_id)
+        if prev_ids is None:
+            trim_len = 0
+            delta_ids = full_input_ids
+        else:
+            prefix_len = 0
+            max_prefix = min(len(prev_ids), len(full_input_ids))
+            while (
+                prefix_len < max_prefix
+                and prev_ids[prefix_len] == full_input_ids[prefix_len]
+            ):
+                prefix_len += 1
+            trim_len = len(prev_ids) - prefix_len
+            delta_ids = full_input_ids[prefix_len:]
+
+        tokenized_obj.streaming_trim_len = trim_len
+        tokenized_obj.input_ids = list(delta_ids)
+
+        if tokenized_obj.is_last_chunk:
+            self.streaming_prompt_states.pop(streaming_id, None)
+        else:
+            self.streaming_prompt_states[streaming_id] = list(full_input_ids)
 
     async def _batch_tokenize_and_process(
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -1050,6 +1108,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             out = state.out_list[-1]
 
             state.out_list = []
+
+            # Handle streaming input chunk ack
+            if out["meta_info"].get("is_streaming_input_chunk"):
+                if state.obj.rid in self.rid_to_state:
+                    del self.rid_to_state[state.obj.rid]
+                yield out
+                break
+
             if state.finished:
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_ts` has not been set yet).
                 # Record response sent time right before we log finished results and metrics.
@@ -1546,6 +1612,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             BatchEmbeddingOutput,
             BatchMultimodalOutput,
             BatchTokenIDOutput,
+            ChunkAckOutput,
         ],
     ):
         for i, rid in enumerate(recv_obj.rids):
@@ -1554,6 +1621,19 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 logger.error(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
+                continue
+
+            if isinstance(recv_obj, ChunkAckOutput):
+                out_dict = {
+                    "text": "",
+                    "meta_info": {
+                        "id": rid,
+                        "finish_reason": None,
+                        "is_streaming_input_chunk": True,
+                    },
+                }
+                state.out_list.append(out_dict)
+                state.event.set()
                 continue
 
             # Build meta_info and return value
@@ -1642,9 +1722,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 state.finished_time_perf = time.perf_counter()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
-                if self.enable_metrics:
-                    self._calculate_timing_metrics(meta_info, state, recv_obj, i)
-
                 trace_req_finish(rid, ts=int(state.finished_time * 1e9))
 
                 del self.rid_to_state[rid]
@@ -1653,12 +1730,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 if self.server_args.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
+            # Log metrics before notifying listeners so timing data is ready in meta_info.
+            if self.enable_metrics and state.obj.log_metrics:
+                self.collect_metrics(state, recv_obj, i)
+            if state.finished and self.enable_metrics:
+                self._calculate_timing_metrics(meta_info, state, recv_obj, i)
+
             state.out_list.append(out_dict)
             state.event.set()
 
-            # Log metrics and dump
-            if self.enable_metrics and state.obj.log_metrics:
-                self.collect_metrics(state, recv_obj, i)
+            # Dump and crash logging need the final response state.
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:

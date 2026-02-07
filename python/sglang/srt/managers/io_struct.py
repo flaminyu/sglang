@@ -197,6 +197,14 @@ class GenerateReqInput(BaseReq):
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
 
+    # For streaming input optimization
+    is_streaming_input: bool = False
+    is_last_chunk: bool = False
+    streaming_input_id: Optional[str] = None
+    streaming_trim_len: Optional[int] = None
+    streaming_total_input_len: Optional[int] = None
+    streaming_payload_is_delta: bool = False
+
     # Validation step duration
     validation_time: Optional[float] = None
 
@@ -673,7 +681,15 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+
+    # For streaming input optimization
+    is_streaming_input: bool = False
+    is_last_chunk: bool = False
+    streaming_input_id: Optional[str] = None
     bootstrap_pair_key: Optional[str] = None
+    streaming_trim_len: int = 0
+    streaming_total_input_len: Optional[int] = None
+    streaming_payload_is_delta: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -1557,6 +1573,11 @@ class LazyDumpTensorsReqInput(BaseReq):
 @dataclass
 class LazyDumpTensorsReqOutput(BaseReq):
     success: bool
+
+
+@dataclass
+class ChunkAckOutput(BaseBatchReq):
+    pass
 
 
 def _check_all_req_types():

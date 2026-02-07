@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import threading
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -30,6 +31,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCallProcessingResult,
     ToolChoice,
     TopLogprob,
+    ChatCompletionMessageContentTextPart,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -65,6 +67,8 @@ class OpenAIServingChat(OpenAIServingBase):
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        self._streaming_chat_states: Dict[str, Dict[str, Any]] = {}
+        self._streaming_chat_lock = threading.Lock()
 
         # Get default sampling parameters from model's generation config
         self.default_sampling_params = (
@@ -143,6 +147,8 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
+        if request.is_streaming_input:
+            self._prepare_streaming_chat_request(request)
         processed_messages = self._process_messages(request, is_multimodal)
 
         # Build sampling parameters
@@ -163,6 +169,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
+        extra_key = self._compute_extra_key(request)
 
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
@@ -175,12 +182,19 @@ class OpenAIServingChat(OpenAIServingBase):
             if first_adapter:
                 self._validate_lora_enabled(first_adapter)
 
+        # For streaming input optimization
+        is_streaming_input = request.is_streaming_input
+        is_last_chunk = request.is_last_chunk
+        streaming_input_id = request.streaming_input_id
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
+            input_embeds=None,
             image_data=processed_messages.image_data,
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
+            log_metrics=True,
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
@@ -188,18 +202,115 @@ class OpenAIServingChat(OpenAIServingBase):
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
             lora_path=lora_path,
+            custom_logit_processor=request.custom_logit_processor,
+            session_params=request.session_params,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
             return_hidden_states=request.return_hidden_states,
-            rid=request.rid,
-            extra_key=self._compute_extra_key(request),
+            rid=getattr(request, "rid", None),
+            extra_key=extra_key,
             priority=request.priority,
             custom_labels=custom_labels,
-            custom_logit_processor=request.custom_logit_processor,
+            # For streaming input optimization
+            is_streaming_input=is_streaming_input,
+            is_last_chunk=is_last_chunk,
+            streaming_input_id=streaming_input_id,
         )
 
         return adapted_request, request
+
+    def _prepare_streaming_chat_request(self, request: ChatCompletionRequest) -> None:
+        streaming_id = request.streaming_input_id
+        if not streaming_id:
+            raise ValueError(
+                "streaming_input_id must be provided when is_streaming_input is true."
+            )
+
+        with self._streaming_chat_lock:
+            state = self._streaming_chat_states.get(streaming_id)
+            if state is None:
+                messages_copy = copy.deepcopy(request.messages)
+                target_idx = self._find_last_user_message_idx(messages_copy)
+                if target_idx is None:
+                    raise ValueError(
+                        "Streaming input chunks must include at least one user message."
+                    )
+                if not request.is_last_chunk:
+                    self._streaming_chat_states[streaming_id] = {
+                        "messages": messages_copy,
+                        "target_idx": target_idx,
+                        "model": request.model,
+                    }
+                request.messages = messages_copy
+                return
+
+            if state["model"] != request.model:
+                raise ValueError(
+                    "The same streaming_input_id cannot be reused across different models."
+                )
+
+            chunk_text = self._extract_streaming_chunk_text(request.messages)
+            target_message: ChatMessage = state["messages"][state["target_idx"]]
+            self._append_chunk_text_to_message(target_message, chunk_text)
+            request.messages = state["messages"]
+
+            if request.is_last_chunk:
+                del self._streaming_chat_states[streaming_id]
+
+    def _find_last_user_message_idx(
+        self, messages: List[ChatMessage]
+    ) -> Optional[int]:
+        for idx in range(len(messages) - 1, -1, -1):
+            if messages[idx].role == "user":
+                return idx
+        return None
+
+    def _extract_streaming_chunk_text(self, messages: List[ChatMessage]) -> str:
+        chunk_parts: List[str] = []
+        for message in messages:
+            if message.role != "user" or message.content is None:
+                continue
+            chunk_parts.append(self._content_to_text(message.content))
+        if not chunk_parts:
+            raise ValueError(
+                "Streaming input chunks must contain user text to append."
+            )
+        return "".join(chunk_parts)
+
+    def _content_to_text(
+        self, content: Union[str, List[Any]]
+    ) -> str:
+        if isinstance(content, str):
+            return content
+        parts: List[str] = []
+        for item in content:
+            if getattr(item, "type", None) != "text":
+                raise ValueError(
+                    "Streaming input currently supports text-only message content."
+                )
+            parts.append(getattr(item, "text", ""))
+        return "".join(parts)
+
+    def _append_chunk_text_to_message(
+        self, message: ChatMessage, chunk_text: str
+    ) -> None:
+        if not chunk_text:
+            return
+        if message.content is None:
+            message.content = chunk_text
+            return
+        if isinstance(message.content, str):
+            message.content += chunk_text
+            return
+        if isinstance(message.content, list):
+            message.content.append(
+                ChatCompletionMessageContentTextPart(type="text", text=chunk_text)
+            )
+            return
+        raise ValueError(
+            "Streaming input currently supports text-only message content."
+        )
 
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
@@ -701,6 +812,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if not isinstance(ret, list):
             ret = [ret]
+
+        if ret and ret[0].get("meta_info", {}).get("is_streaming_input_chunk"):
+            return self._build_streaming_input_chunk_ack_response(
+                request, ret[0]["meta_info"]
+            )
 
         response = self._build_chat_response(
             request,

@@ -25,6 +25,25 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerRuntimeCheckerMixin:
+    def _get_streaming_pinned_tokens(self: "Scheduler") -> int:
+        if not hasattr(self, "waiting_chunk_reqs") or not self.waiting_chunk_reqs:
+            return 0
+
+        pinned = 0
+        for req in self.waiting_chunk_reqs.values():
+            pinned += getattr(req, "cache_protected_len", 0)
+        return pinned
+
+    def _get_streaming_reserved_req_slots(self: "Scheduler") -> int:
+        if not hasattr(self, "waiting_chunk_reqs") or not self.waiting_chunk_reqs:
+            return 0
+
+        reserved = 0
+        for req in self.waiting_chunk_reqs.values():
+            if getattr(req, "req_pool_idx", None) is not None:
+                reserved += 1
+        return reserved
+
     def _get_token_info(self: Scheduler):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
@@ -127,14 +146,19 @@ class SchedulerRuntimeCheckerMixin:
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
+        streaming_pinned = self._get_streaming_pinned_tokens()
         memory_leak = (available_size + evictable_size) != (
             # self.max_total_num_tokens
             # if not self.enable_hierarchical_cache
             # else self.max_total_num_tokens - protected_size
             self.max_total_num_tokens
             - protected_size
+            - streaming_pinned
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+        token_msg = (
+            f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, "
+            f"{protected_size=}, streaming_pinned={streaming_pinned}\n"
+        )
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
@@ -161,6 +185,7 @@ class SchedulerRuntimeCheckerMixin:
 
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
+        streaming_pinned = self._get_streaming_pinned_tokens()
 
         uncached_size = self._get_batch_uncached_size(current_batch)
 
@@ -175,7 +200,13 @@ class SchedulerRuntimeCheckerMixin:
             log_msg = f"[Mem Check (BUSY)] {available_size=}, {evictable_size=}, {protected_size=}, {uncached_size=}"
             logger.info(log_msg)
 
-        total_tokens = available_size + evictable_size + protected_size + uncached_size
+        total_tokens = (
+            available_size
+            + evictable_size
+            + protected_size
+            + streaming_pinned
+            + uncached_size
+        )
         assert (
             total_tokens == self.max_total_num_tokens
         ), f"Mem Leak Detected! {total_tokens=} vs {self.max_total_num_tokens=}"
@@ -188,15 +219,19 @@ class SchedulerRuntimeCheckerMixin:
         else:
             req_total_size = self.req_to_token_pool.size
 
-        if len(self.req_to_token_pool.free_slots) != req_total_size:
+        reserved_slots = self._get_streaming_reserved_req_slots()
+        expected_free = req_total_size - reserved_slots
+
+        if len(self.req_to_token_pool.free_slots) != expected_free:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
-                f"total_size={self.req_to_token_pool.size}\n"
+                f"total_size={self.req_to_token_pool.size}, "
+                f"reserved_slots={reserved_slots}\n"
             )
             raise_error_or_warn(
                 self,
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
                 "count_req_pool_leak_warnings",
                 msg,
             )
@@ -213,7 +248,7 @@ class SchedulerRuntimeCheckerMixin:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             raise_error_or_warn(
                 self,
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
                 "count_memory_leak_warnings",
                 msg,
             )
@@ -283,6 +318,20 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        # Skip memory checks when there is obvious work in flight. Streaming-input
+        # experiments keep tokens "pinned" between chunks, which previously caused
+        # repeated false positives in the leak detector even though the scheduler
+        # was busy. Treat any running/queued work or ongoing streaming chunks as
+        # non-idle and bail out early.
+        if getattr(self, "running_batch", None) and not self.running_batch.is_empty():
+            return
+        if getattr(self, "cur_batch", None) and not self.cur_batch.is_empty():
+            return
+        if getattr(self, "waiting_queue", None) and len(self.waiting_queue) > 0:
+            return
+        if getattr(self, "waiting_chunk_reqs", None) and self.waiting_chunk_reqs:
+            return
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return

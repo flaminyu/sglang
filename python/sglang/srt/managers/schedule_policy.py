@@ -472,6 +472,10 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
+        if last_node is None:
+            yield None
+            return
+
         if self.is_hybrid:
             try:
                 swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
@@ -594,6 +598,20 @@ class PrefillAdder:
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
 
+        def _maybe_pin_tree_cache():
+            """Increment tree cache lock refs only when a radix node exists."""
+
+            if req.last_node is None:
+                req.swa_uuid_for_lock = None
+                return
+
+            if self.is_hybrid:
+                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
+                req.swa_uuid_for_lock = swa_uuid_for_lock
+            else:
+                self.tree_cache.inc_lock_ref(req.last_node)
+                req.swa_uuid_for_lock = None
+
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
@@ -616,11 +634,7 @@ class PrefillAdder:
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
-                if self.is_hybrid:
-                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
-                    req.swa_uuid_for_lock = swa_uuid_for_lock
-                else:
-                    self.tree_cache.inc_lock_ref(req.last_node)
+                _maybe_pin_tree_cache()
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -652,11 +666,7 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
-                if self.is_hybrid:
-                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
-                    req.swa_uuid_for_lock = swa_uuid_for_lock
-                else:
-                    self.tree_cache.inc_lock_ref(req.last_node)
+                _maybe_pin_tree_cache()
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()

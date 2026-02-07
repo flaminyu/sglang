@@ -43,7 +43,7 @@ import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -463,6 +463,9 @@ class Req:
         extra_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        is_streaming_input: bool = False,
+        is_last_chunk: bool = False,
+        streaming_input_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -494,6 +497,17 @@ class Req:
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
+
+        # For streaming input optimization
+        self.waiting_for_next_chunk = False
+        self.is_streaming_input = is_streaming_input
+        self.is_last_chunk = is_last_chunk
+        self.streaming_input_id = streaming_input_id
+        self.streaming_prefill_inflight = False
+        self.streaming_pending_chunk = False
+        self.streaming_has_pinned_prefix = False
+        self.is_in_scheduler = False
+        self.streaming_buffer: List[Dict[str, Any]] = []
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -753,6 +767,13 @@ class Req:
 
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         self.fill_ids = self.origin_input_ids + self.output_ids
+
+        if self.is_streaming_input and self.streaming_has_pinned_prefix:
+            # Skip radix matching: prefix_indices already reference the pinned KV pages
+            self.cache_protected_len = len(self.prefix_indices)
+            self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+            return
+
         input_len = len(self.fill_ids)
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
@@ -961,6 +982,10 @@ class Req:
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
+        self.waiting_for_next_chunk = False
+        self.streaming_prefill_inflight = False
+        self.streaming_pending_chunk = False
+        self.streaming_has_pinned_prefix = False
         self.mamba_pool_idx = None
         self.already_computed = 0
         self.kv_allocated_len = 0

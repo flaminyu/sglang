@@ -489,7 +489,8 @@ class SWARadixCache(BasePrefixCache):
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
-        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -560,7 +561,8 @@ class SWARadixCache(BasePrefixCache):
 
         req.cache_protected_len = len(new_indices)
 
-        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
         swa_uuid_for_lock = self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
