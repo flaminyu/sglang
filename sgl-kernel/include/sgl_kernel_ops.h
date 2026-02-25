@@ -149,6 +149,14 @@ void apply_rope_pos_ids_cos_sin_cache(
     const std::optional<at::Tensor>& v_buffer,
     const std::optional<at::Tensor>& kv_cache_loc);
 
+void rotary_embedding(
+    torch::Tensor& positions,
+    torch::Tensor& query,
+    std::optional<torch::Tensor> key,
+    int64_t head_size,
+    torch::Tensor& cos_sin_cache,
+    bool is_neox);
+
 void downcast_fp8(
     at::Tensor& k,
     at::Tensor& v,
@@ -253,25 +261,6 @@ void bmm_fp8(
 void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
-torch::Tensor gptq_marlin_gemm(
-    torch::Tensor& a,
-    std::optional<torch::Tensor> c_or_none,
-    torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales,
-    std::optional<torch::Tensor> const& global_scale_or_none,
-    std::optional<torch::Tensor> const& b_zeros_or_none,
-    std::optional<torch::Tensor> const& g_idx_or_none,
-    std::optional<torch::Tensor> const& perm_or_none,
-    torch::Tensor& workspace,
-    sglang::ScalarTypeId const& b_q_type_id,
-    int64_t size_m,
-    int64_t size_n,
-    int64_t size_k,
-    bool is_k_full,
-    bool use_atomic_add,
-    bool use_fp32_reduce,
-    bool is_zp_float);
-
 torch::Tensor gptq_gemm(
     torch::Tensor a,
     torch::Tensor b_q_weight,
@@ -282,11 +271,6 @@ torch::Tensor gptq_gemm(
     int64_t bit);
 
 void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
-
-torch::Tensor
-gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_k, int64_t size_n, int64_t num_bits);
-
-torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits);
 
 /*
  * From csrc/moe
@@ -378,6 +362,24 @@ void apply_shuffle_mul_sum(
     const torch::Tensor& permutation,
     const std::optional<torch::Tensor>& factors);
 
+void fused_qk_norm_rope(
+    torch::Tensor& qkv,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t num_heads_v,
+    int64_t head_dim,
+    double eps,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    double base,
+    bool is_neox,
+    torch::Tensor& position_ids,
+    double factor,
+    double low,
+    double high,
+    double attention_factor,
+    int64_t rotary_dim);
+
 void cutlass_fp4_group_mm(
     torch::Tensor& output,
     const torch::Tensor& a,
@@ -442,7 +444,9 @@ torch::Tensor moe_wna16_marlin_gemm(
     torch::Tensor& a,
     std::optional<torch::Tensor> const& c_or_none,
     torch::Tensor& b_q_weight,
+    std::optional<torch::Tensor> const& b_bias_or_none,
     torch::Tensor& b_scales,
+    std::optional<torch::Tensor> const& global_scale_or_none,
     std::optional<torch::Tensor> const& b_zeros_or_none,
     std::optional<torch::Tensor> const& g_idx_or_none,
     std::optional<torch::Tensor> const& perm_or_none,
@@ -890,14 +894,23 @@ void es_fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
 
-/*
- * From fast-hadamard-transform
- */
-torch::Tensor fast_hadamard_transform(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_12N(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_20N(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_28N(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_40N(torch::Tensor& x, double scale);
+void es_sm100_mxfp8_blockscaled_grouped_mm(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& sfa,
+    const torch::Tensor& sfb,
+    torch::Tensor& d,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& blockscale_offsets);
+
+void es_sm100_mxfp8_blockscaled_grouped_quant(
+    const torch::Tensor& input,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& blockscale_offsets,
+    torch::Tensor& quant_output,
+    torch::Tensor& scale_factor);
 
 /*
  * From flashmla

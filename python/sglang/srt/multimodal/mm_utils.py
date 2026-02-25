@@ -27,6 +27,7 @@ LLaVA-NeXT : https://llava-vl.github.io/blog/2024-01-30-llava-next/
 LLaVA-Onevision : https://arxiv.org/pdf/2408.03326
 
 """
+
 import ast
 import itertools
 import math
@@ -428,6 +429,40 @@ def get_dp_encoder_lb_assignment(
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
+def run_dp_sharded_vision_model(
+    image_input: torch.Tensor, vision_model: torch.nn.Module
+) -> torch.Tensor:
+    """Run a vision model with data parallelism (DP) sharding. The function
+    will shard the input image tensor on the first dimension and run the vision
+    model
+
+    Args:
+        image_input (torch.Tensor): Image input tensor.
+        vision_model (torch.nn.Module): Vision model.
+    Returns:
+        torch.Tensor: Output image embeddings
+    """
+
+    num_chunks = image_input.shape[0]
+    mp_world_size = get_tensor_model_parallel_world_size()
+    num_chunks_per_rank = (num_chunks + mp_world_size - 1) // mp_world_size
+    num_padded_chunks = num_chunks_per_rank * mp_world_size - num_chunks
+    pad = (0,) * (2 * (image_input.dim() - 1)) + (0, num_padded_chunks)
+    image_input_padded = torch.nn.functional.pad(image_input, pad)
+    rank = get_tensor_model_parallel_rank()
+    image_input_per_rank = image_input_padded[
+        rank * num_chunks_per_rank : (rank + 1) * num_chunks_per_rank, ...
+    ]
+
+    vision_embeddings = vision_model(image_input_per_rank)
+    # Ensure tensor is contiguous before all_gather
+    vision_embeddings = vision_embeddings.last_hidden_state.contiguous()
+    vision_embeddings = tensor_model_parallel_all_gather(vision_embeddings, dim=0)
+    vision_embeddings = vision_embeddings[:num_chunks, ...]
+    return vision_embeddings
+
+
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def run_dp_sharded_mrope_vision_model(
     vision_model: torch.nn.Module,
     pixel_values: torch.Tensor,
@@ -461,11 +496,19 @@ def run_dp_sharded_mrope_vision_model(
         ```
 
     """
-    tp_size = get_tensor_model_parallel_world_size()
+    from sglang.srt.layers.dp_attention import (
+        get_attention_tp_group,
+        get_attention_tp_rank,
+        get_attention_tp_size,
+    )
+
+    tp_size = get_attention_tp_size()
+    if tp_size == 1:
+        return vision_model(pixel_values, grid_thw=torch.tensor(grid_thw_list))
 
     # GPU_0 tp_rank_local = 0
     # GPU_1 tp_rank_local = 1
-    tp_rank_local = get_tensor_model_parallel_rank()
+    tp_rank_local = get_attention_tp_rank()
 
     # patches_per_image = [1000, 100, 200, 50]
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
@@ -477,7 +520,7 @@ def run_dp_sharded_mrope_vision_model(
     # image_to_tp_rank = [0, 2, 1, 3]
     # gpu_sample_counts = [1, 3]
     # grouped_pixel_values_len = [1000, 350]
-    (image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len) = (
+    image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
         get_dp_encoder_lb_assignment(patches_per_image, tp_size)
     )
 
@@ -577,7 +620,9 @@ def run_dp_sharded_mrope_vision_model(
         image_embeds_local_padded = image_embeds_local
 
     # Do all_gather to collect embeddings from all ranks
-    gathered_embeds = tensor_model_parallel_all_gather(image_embeds_local_padded, dim=0)
+    gathered_embeds = get_attention_tp_group().all_gather(
+        image_embeds_local_padded, dim=0
+    )
 
     # Remove padding and reconstruct per-rank embeddings
     rank_embeddings = list[torch.Tensor]()

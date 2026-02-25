@@ -91,6 +91,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
 
   m.def(
+      "rotary_embedding(Tensor positions, Tensor! query,"
+      "                 Tensor!? key, int head_size,"
+      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
+  m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
+
+  m.def(
       "downcast_fp8(Tensor k, Tensor v, Tensor k_out, Tensor v_out, Tensor k_scale, Tensor v_scale, Tensor loc, "
       "int mult, int offset) -> ()");
   m.impl("downcast_fp8", torch::kCUDA, &downcast_fp8);
@@ -136,19 +142,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fp8_blockwise_scaled_mm", torch::kCUDA, &fp8_blockwise_scaled_mm);
 
   m.def(
-      "sgl_per_token_group_quant_8bit(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+      "sgl_per_token_group_quant_8bit(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
       " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
   m.impl("sgl_per_token_group_quant_8bit", torch::kCUDA, &sgl_per_token_group_quant_8bit);
 
   m.def(
-      "sgl_per_token_group_quant_8bit_v2(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+      "sgl_per_token_group_quant_8bit_v2(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
       " float eps, float fp8_min, float fp8_max, bool scale_ue8m0, bool fuse_silu_and_mul, Tensor? masked_m) -> ()");
   m.impl("sgl_per_token_group_quant_8bit_v2", torch::kCUDA, &sgl_per_token_group_quant_8bit_v2);
 
-  m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
+  m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s, bool is_static) -> ()");
   m.impl("sgl_per_tensor_quant_fp8", torch::kCUDA, &sgl_per_tensor_quant_fp8);
 
-  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor output_q, Tensor output_s) -> ()");
+  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 
   m.def(
@@ -191,26 +197,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * From csrc/gemm/gptq
    */
   m.def(
-      "gptq_marlin_gemm(Tensor! a, Tensor? c_or_none,"
-      "Tensor! b_q_weight, Tensor! b_scales, Tensor? global_scale_or_none,"
-      "Tensor? b_zeros_or_none, Tensor? g_idx_or_none, Tensor? perm_or_none,"
-      "Tensor! workspace, int b_q_type_id, int size_m, int size_n, int size_k,"
-      "bool is_k_full, bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor");
-  m.impl("gptq_marlin_gemm", torch::kCUDA, &gptq_marlin_gemm);
-
-  m.def(
       "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor b_g_idx, bool "
       "use_shuffle, int bit) -> Tensor");
   m.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
 
   m.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
   m.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
-
-  m.def("gptq_marlin_repack(Tensor! b_q_weight, Tensor! perm, int size_k, int size_n, int num_bits) -> Tensor");
-  m.impl("gptq_marlin_repack", torch::kCUDA, &gptq_marlin_repack);
-
-  m.def("awq_marlin_repack(Tensor! b_q_weight, int size_k, int size_n, int num_bits) -> Tensor");
-  m.impl("awq_marlin_repack", torch::kCUDA, &awq_marlin_repack);
 
   /*
    * From csrc/moe
@@ -264,8 +256,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
   m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
+
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
+
+  m.def(
+      "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
+      "int num_heads_k, int num_heads_v, int head_dim, float eps, "
+      "Tensor q_weight, Tensor k_weight, float base, "
+      "bool is_neox, Tensor position_ids, float factor, float low, float high, float attention_factor, int rotary_dim) "
+      "-> ()");
+  m.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
 
   /*
    * From csrc/moe/cutlass_moe/w4a8
@@ -291,7 +292,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def(
       "moe_wna16_marlin_gemm(Tensor! a, Tensor? c_or_none,"
-      "Tensor! b_q_weight, Tensor! b_scales, Tensor? b_zeros_or_none,"
+      "Tensor! b_q_weight, Tensor? b_bias_or_none, Tensor! b_scales,"
+      "Tensor? global_scale_or_none, Tensor? b_zeros_or_none,"
       "Tensor? g_idx_or_none, Tensor? perm_or_none, Tensor! workspace,"
       "Tensor sorted_token_ids,"
       "Tensor! expert_ids, Tensor! num_tokens_past_padded,"
@@ -567,24 +569,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "stride_a, Tensor stride_b, Tensor stride_d, Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> "
       "()");
   m.impl("es_fp8_blockwise_scaled_grouped_mm", &es_fp8_blockwise_scaled_grouped_mm);
-
-  /*
-   * From fast-hadamard-transform
-   */
-  m.def("fast_hadamard_transform(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform", torch::kCUDA, &fast_hadamard_transform);
-
-  m.def("fast_hadamard_transform_12N(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform_12N", torch::kCUDA, &fast_hadamard_transform_12N);
-
-  m.def("fast_hadamard_transform_20N(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform_20N", torch::kCUDA, &fast_hadamard_transform_20N);
-
-  m.def("fast_hadamard_transform_28N(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform_28N", torch::kCUDA, &fast_hadamard_transform_28N);
-
-  m.def("fast_hadamard_transform_40N(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform_40N", torch::kCUDA, &fast_hadamard_transform_40N);
+  m.def(
+      "es_sm100_mxfp8_blockscaled_grouped_mm(Tensor a, Tensor b, Tensor sfa, Tensor sfb, Tensor d, Tensor "
+      "problem_sizes, Tensor expert_offsets, Tensor blockscale_offsets) -> ()");
+  m.impl("es_sm100_mxfp8_blockscaled_grouped_mm", &es_sm100_mxfp8_blockscaled_grouped_mm);
+  m.def(
+      "es_sm100_mxfp8_blockscaled_grouped_quant(Tensor input, Tensor problem_sizes, Tensor expert_offsets, Tensor "
+      "blockscale_offsets, Tensor quant_output, Tensor scale_factor) -> () ");
+  m.impl("es_sm100_mxfp8_blockscaled_grouped_quant", &es_sm100_mxfp8_blockscaled_grouped_quant);
 }
 
 REGISTER_EXTENSION(common_ops)

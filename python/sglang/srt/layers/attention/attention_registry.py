@@ -70,7 +70,9 @@ def create_wave_backend(runner):
 
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
-    from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+    from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+        AscendAttnBackend,
+    )
 
     return AscendAttnBackend(runner)
 
@@ -187,14 +189,21 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-            GDNAttnBackend,
             HybridLinearAttnBackend,
-            KimiLinearAttnBackend,
             Mamba2AttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.layers.attention.linear.lightning_backend import (
+            LightningAttentionBackend,
+        )
+        from sglang.srt.layers.attention.linear.utils import (
+            initialize_linear_attn_config,
         )
         from sglang.srt.utils import is_blackwell, is_npu
 
         check_environments()
+        initialize_linear_attn_config(runner.server_args)
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
                 assert (
@@ -210,7 +219,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.kimi_linear_config is not None:
-            linear_attn_backend = KimiLinearAttnBackend(runner)
+            linear_attn_backend = KDAAttnBackend(runner)
+        elif runner.hybrid_lightning_config is not None:
+            linear_attn_backend = LightningAttentionBackend(runner)
         else:
             raise ValueError(
                 "Expected hybrid GDN or NemotronH models, but got unknown model."
