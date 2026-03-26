@@ -39,6 +39,10 @@ from sglang.srt.mem_cache.radix_cache import (
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.observability.continuum_kv_trace import (
+    get_namespace_trace,
+    record_namespace_load_back,
+)
 from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 if TYPE_CHECKING:
@@ -49,6 +53,13 @@ logger = logging.getLogger(__name__)
 
 
 class HiRadixCache(RadixCache):
+
+    def _get_load_back_bytes_per_token(self) -> float:
+        size_per_token = getattr(self.token_to_kv_pool_host, "size_per_token", 0)
+        try:
+            return float(size_per_token or 0.0)
+        except Exception:
+            return 0.0
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
@@ -860,7 +871,14 @@ class HiRadixCache(RadixCache):
 
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
-            assert v == x, f"parent does not have child key, {key}"
+            if v != x:
+                # Concurrent modification: either the key was already removed or
+                # points to a different node.  Restore if needed and skip.
+                if v is not None:
+                    x.parent.children[key] = v
+                if x in self.evictable_host_leaves:
+                    self.evictable_host_leaves.remove(x)
+                continue
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
             self._update_host_leaf_status(x.parent)
@@ -868,6 +886,116 @@ class HiRadixCache(RadixCache):
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+    def continuum_evict_worker_namespace(self, worker_id: str) -> dict[str, int | str]:
+        marker = f"__continuum_worker={worker_id}__"
+        num_nodes_removed = 0
+        num_device_tokens_evicted = 0
+        num_host_tokens_evicted = 0
+
+        def _all_leaves() -> list[TreeNode]:
+            leaves: list[TreeNode] = []
+            stack = [self.root_node]
+            while stack:
+                cur = stack.pop()
+                if cur is self.root_node:
+                    stack.extend(cur.children.values())
+                    continue
+                if len(cur.children) == 0:
+                    leaves.append(cur)
+                else:
+                    stack.extend(cur.children.values())
+            return leaves
+
+        def _belongs_to_worker(node: TreeNode) -> bool:
+            cur = node
+            while cur is not None and cur is not self.root_node:
+                extra_key = cur.key.extra_key if cur.key is not None else None
+                if extra_key and marker in extra_key:
+                    return True
+                cur = cur.parent
+            return False
+
+        changed = True
+        while changed:
+            changed = False
+
+            device_leaves = _all_leaves()
+            for node in device_leaves:
+                if node is self.root_node:
+                    continue
+                if not _belongs_to_worker(node):
+                    continue
+
+                if not node.evicted and node.value is not None:
+                    if node.backuped:
+                        num_device_tokens_evicted += self.cache_controller.evict_device(
+                            node.value
+                        )
+                    else:
+                        self.cache_controller.mem_pool_device_allocator.free(node.value)
+                        num_device_tokens_evicted += len(node.value)
+                    node.value = None
+                    self._record_remove_event(node)
+
+                if node.backuped and node.host_ref_counter == 0:
+                    num_host_tokens_evicted += self.cache_controller.evict_host(
+                        node.host_value
+                    )
+
+                key = self.get_child_key_fn(node.key)
+                v = node.parent.children.pop(key, None)
+                if v != node:
+                    if v is not None:
+                        node.parent.children[key] = v
+                    continue
+
+                if node in self.evictable_leaves:
+                    self.evictable_leaves.remove(node)
+                if node in self.evictable_host_leaves:
+                    self.evictable_host_leaves.remove(node)
+
+                self._update_leaf_status(node.parent)
+                self._update_host_leaf_status(node.parent)
+                num_nodes_removed += 1
+                changed = True
+
+            host_leaves = _all_leaves()
+            for node in host_leaves:
+                if node is self.root_node:
+                    continue
+                if not _belongs_to_worker(node):
+                    continue
+                if not node.evicted:
+                    continue
+
+                num_host_tokens_evicted += self.cache_controller.evict_host(
+                    node.host_value
+                )
+
+                key = self.get_child_key_fn(node.key)
+                v = node.parent.children.pop(key, None)
+                if v != node:
+                    if v is not None:
+                        node.parent.children[key] = v
+                    continue
+
+                if node in self.evictable_host_leaves:
+                    self.evictable_host_leaves.remove(node)
+                if node in self.evictable_leaves:
+                    self.evictable_leaves.remove(node)
+
+                self._update_host_leaf_status(node.parent)
+                self._update_leaf_status(node.parent)
+                num_nodes_removed += 1
+                changed = True
+
+        return {
+            "num_nodes_removed": num_nodes_removed,
+            "num_device_tokens_evicted": num_device_tokens_evicted,
+            "num_host_tokens_evicted": num_host_tokens_evicted,
+            "message": "ok",
+        }
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
@@ -919,9 +1047,74 @@ class HiRadixCache(RadixCache):
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
+        load_back_duration = time.perf_counter() - start_time
+        bytes_per_token = self._get_load_back_bytes_per_token()
+        load_back_bytes = int(round(len(device_indices) * bytes_per_token)) if bytes_per_token > 0 else 0
+        extra_key = None
+        if last_hit_node.key is not None:
+            extra_key = last_hit_node.key.extra_key
+        trace_ctx = record_namespace_load_back(
+            extra_key,
+            node_id=int(last_hit_node.id),
+            num_tokens=int(len(device_indices)),
+            kv_cache_size_bytes=load_back_bytes,
+            duration_sec=load_back_duration,
+        )
+        if not trace_ctx:
+            trace_ctx = get_namespace_trace(extra_key)
+
+        # Fallback: parse worker_id from extra_key when trace is empty (cross-process)
+        if not trace_ctx.get("worker_id") and extra_key:
+            _ek = str(extra_key)
+            _wstart = _ek.find("__continuum_worker=")
+            if _wstart >= 0:
+                _wval = _ek[_wstart + len("__continuum_worker="):]
+                _wend = _wval.find("__")
+                trace_ctx["worker_id"] = _wval[:_wend] if _wend >= 0 else _wval
+                _pstart = _ek.find("__policy=")
+                if _pstart >= 0:
+                    _pval = _ek[_pstart + len("__policy="):]
+                    _pend = _pval.find("__")
+                    trace_ctx["ttl_source"] = _pval[:_pend] if _pend >= 0 else _pval
+                else:
+                    _mstart = _ek.find("__mode=")
+                    if _mstart >= 0:
+                        _mval = _ek[_mstart + len("__mode="):]
+                        _mend = _mval.find("__")
+                        trace_ctx["ttl_source"] = _mval[:_mend] if _mend >= 0 else _mval
+
+        logger.info(
+            "KV_LOAD_BACK_EVENT %s",
+            json.dumps(
+                {
+                    "ts": round(time.time(), 6),
+                    "node_id": int(last_hit_node.id),
+                    "num_tokens": int(len(device_indices)),
+                    "kv_cache_size_bytes": load_back_bytes,
+                    "kv_cache_size_mb": round(load_back_bytes / (1024**2), 6) if load_back_bytes else 0.0,
+                    "kv_cache_size_gb": round(load_back_bytes / (1024**3), 6) if load_back_bytes else 0.0,
+                    "bytes_per_token": round(bytes_per_token, 6) if bytes_per_token > 0 else 0.0,
+                    "duration_sec": round(load_back_duration, 6),
+                    "size_source": "host_pool_size_per_token",
+                    "extra_key": extra_key,
+                    "worker_id": trace_ctx.get("worker_id"),
+                    "program_id": trace_ctx.get("program_id"),
+                    "tool_name": trace_ctx.get("tool_name"),
+                    "task_type": trace_ctx.get("task_type"),
+                    "prompt_excerpt": trace_ctx.get("prompt_excerpt"),
+                    "output_excerpt": trace_ctx.get("output_excerpt"),
+                    "ttl_sec": trace_ctx.get("ttl_sec"),
+                    "ttl_source": trace_ctx.get("ttl_source"),
+                    "last_queueing_sec": trace_ctx.get("last_queueing_sec"),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(
-                time.perf_counter() - start_time
+                load_back_duration
             )
             self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 

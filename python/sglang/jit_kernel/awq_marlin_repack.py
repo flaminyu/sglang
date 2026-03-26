@@ -9,6 +9,11 @@ from sglang.jit_kernel.utils import cache_once, load_jit
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+try:
+    from sgl_kernel import awq_marlin_repack as aot_awq_marlin_repack
+except ImportError:
+    aot_awq_marlin_repack = None
+
 
 @cache_once
 def _jit_awq_marlin_repack_module() -> Module:
@@ -25,6 +30,9 @@ def awq_marlin_repack(
     size_n: int,
     num_bits: int,
 ) -> torch.Tensor:
+    if aot_awq_marlin_repack is not None:
+        return aot_awq_marlin_repack(b_q_weight, size_k, size_n, num_bits)
+
     tile_size = 16
     pack_factor = 32 // num_bits
     out = torch.empty(

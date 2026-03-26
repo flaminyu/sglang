@@ -355,3 +355,10 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         )
 
         return StandardCombineInput(hidden_states=output)
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        return self.apply(layer, dispatch_output)

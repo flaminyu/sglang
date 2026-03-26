@@ -88,6 +88,100 @@ class CacheAgnosticPolicy(Enum):
     LOF = "lof"  # longest output first
     RANDOM = "random"
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
+    CONTINUUM = "continuum"  # per-turn aware: job_id affinity + pinned KV prioritization
+
+
+class ContinuumRequestQueue:
+    """
+    Per-turn-aware request queue for multi-turn agent scheduling.
+
+    Scheduling priority:
+    1. Pinned requests — requests whose job_id has KV cached on GPU and waiting
+       for the next turn. Prioritizing these avoids wasted reloads.
+    2. Same job_id requests — prefer scheduling turns from the same conversation
+       together to reduce per-turn queueing delay.
+    3. Other requests — ordered by job's first-entry FCFS time.
+
+    The caller is responsible for:
+    - Recording job_first_entry_time when a request first enters the queue.
+    - Keeping the pinned_requests list up-to-date (add on pin, remove on unpin).
+    """
+
+    def __init__(self):
+        # job_id (or session_id as fallback) → first entry time
+        self.job_id_first_entry_time: dict[str, float] = {}
+
+    def _get_affinity_key(self, req) -> str:
+        """Return job_id if set, else session_id, else a unique placeholder."""
+        if req.job_id:
+            return req.job_id
+        if req.session_id:
+            return req.session_id
+        return f"__noid__{id(req)}"
+
+    def record_first_entry(self, req, current_time: float) -> None:
+        """Record the first entry time when a request (or its job_id) first entered the queue."""
+        key = self._get_affinity_key(req)
+        if key not in self.job_id_first_entry_time:
+            self.job_id_first_entry_time[key] = current_time
+
+    def get_first_entry_time(self, req) -> float:
+        """Return the first entry time for this request's job/session."""
+        key = self._get_affinity_key(req)
+        return self.job_id_first_entry_time.get(key, req.time_stats.wait_queue_entry_time)
+
+    def peek_best_request(
+        self,
+        waiting_queue: list,
+        pinned_requests: list,
+    ):
+        """
+        Return the best request to schedule next, without removing it.
+
+        Priority:
+        1. Requests whose job_id matches a pinned request (can reuse cached KV).
+        2. Among unpinned, pick the one whose job arrived earliest.
+        """
+        pinned_job_ids = {
+            self._get_affinity_key(r) for r in pinned_requests
+        }
+
+        pinned_candidates = []
+        unpinned_candidates = []
+
+        for req in waiting_queue:
+            key = self._get_affinity_key(req)
+            entry_time = self.get_first_entry_time(req)
+            if key in pinned_job_ids:
+                pinned_candidates.append((entry_time, req))
+            else:
+                unpinned_candidates.append((entry_time, req))
+
+        # Prefer pinned: pick earliest entry
+        if pinned_candidates:
+            pinned_candidates.sort(key=lambda x: x[0])
+            return pinned_candidates[0][1]
+
+        # Fall back to earliest entry time
+        if unpinned_candidates:
+            unpinned_candidates.sort(key=lambda x: x[0])
+            return unpinned_candidates[0][1]
+
+        return None  # empty queue
+
+    def sort_queue(
+        self,
+        waiting_queue: list,
+        pinned_requests: list,
+    ) -> None:
+        """
+        Reorder waiting_queue in-place: pinned jobs first, then by job entry time.
+        This is called by SchedulePolicy.calc_priority when policy=continuum.
+        """
+        best = self.peek_best_request(waiting_queue, pinned_requests)
+        if best and waiting_queue and best is not waiting_queue[0]:
+            waiting_queue.remove(best)
+            waiting_queue.insert(0, best)
 
 
 class SchedulePolicy:
@@ -100,6 +194,9 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        # Continuum per-turn state (injected from Scheduler)
+        continuum_queue: Optional[ContinuumRequestQueue] = None,
+        pinned_requests: Optional[list] = None,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -107,6 +204,8 @@ class SchedulePolicy:
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+        self.continuum_queue: Optional[ContinuumRequestQueue] = continuum_queue
+        self.pinned_requests: list = pinned_requests if pinned_requests is not None else []
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -151,6 +250,11 @@ class SchedulePolicy:
             elif policy == CacheAgnosticPolicy.ROUTING_KEY:
                 if running_batch is not None:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
+            elif policy == CacheAgnosticPolicy.CONTINUUM:
+                # Per-turn aware: pinned jobs first, then job-level FCFS.
+                # continuum_queue and pinned_requests are injected via __init__.
+                if self.continuum_queue is not None:
+                    self.continuum_queue.sort_queue(waiting_queue, self.pinned_requests)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
         return prefix_computed

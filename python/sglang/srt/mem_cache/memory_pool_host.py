@@ -267,7 +267,12 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat([self.free_slots, indices])
+        if indices.numel() == 0:
+            return 0
+        if self.free_slots.numel() == 0:
+            self.free_slots = indices
+        else:
+            self.free_slots = torch.cat([self.free_slots, indices])
         return len(indices)
 
 

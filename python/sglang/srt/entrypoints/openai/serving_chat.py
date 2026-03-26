@@ -312,6 +312,8 @@ class OpenAIServingChat(OpenAIServingBase):
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
         )
 
+        self.apply_continuum_worker_policy(adapted_request, raw_request)
+
         return adapted_request, request
 
     def _process_messages(

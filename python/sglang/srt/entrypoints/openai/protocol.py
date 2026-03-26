@@ -871,8 +871,14 @@ class DeltaMessage(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        if self.hidden_states is None:
-            data.pop("hidden_states", None)
+        # Filter out None-valued fields to ensure OpenAI-compatible streaming output.
+        # Without this fix, chunks emit `role: null, content: null` which breaks
+        # clients that expect the assistant role and non-null content from the first
+        # streaming chunk. See: https://github.com/sgl-project/sglang/pull/19858
+        data.pop("hidden_states", None)
+        for field in ("role", "content", "reasoning_content", "tool_calls"):
+            if data.get(field) is None:
+                data.pop(field, None)
         return data
 
 

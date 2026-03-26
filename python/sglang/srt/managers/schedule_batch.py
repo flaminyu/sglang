@@ -513,6 +513,9 @@ class Req(ReqDllmMixin):
         disagg_prefill_dp_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
+        # Continuum per-turn fields (can also be passed via session_params)
+        job_id: Optional[str] = None,
+        last_func_call: Optional[str] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
@@ -773,6 +776,31 @@ class Req(ReqDllmMixin):
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
+
+        # Continuum per-turn scheduling fields
+        # job_id: groups requests belonging to the same multi-turn conversation.
+        # When a new turn arrives, it carries the job_id of its conversation,
+        # so the scheduler can prioritize requests sharing the same job_id
+        # to reduce per-turn queueing delay.
+        self.job_id: Optional[str] = job_id
+        # last_func_call: tool name from the LLM output of the previous turn.
+        # Used by ToolCallEstimator to predict how long to pin KV cache.
+        self.last_func_call: Optional[str] = last_func_call
+        # is_last_step: True when the conversation is finished (no more turns).
+        # Used to decide whether to keep KV cache pinned or free it.
+        self.is_last_step: bool = True
+        # this_func_call: tool name parsed from the current turn's LLM output.
+        # Recorded by ToolCallEstimator after decoding.
+        self.this_func_call: Optional[str] = None
+        # job_first_entry_time: monotonic timestamp of when this job_id
+        # first entered the waiting queue. Used for job-level FCFS ordering.
+        self.job_first_entry_time: float = 0.0
+        # is_pinned: True when the request's KV cache is pinned in GPU memory
+        # after finishing (waiting for the next turn in the same job).
+        self.is_pinned: bool = False
+        # pin_expire_time: absolute timestamp when the pin expires and
+        # the KV cache should be freed if the next turn hasn't arrived.
+        self.pin_expire_time: float = 0.0
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.

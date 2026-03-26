@@ -3238,6 +3238,7 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "continuum",
             ],
             help="The scheduling policy of the requests.",
         )

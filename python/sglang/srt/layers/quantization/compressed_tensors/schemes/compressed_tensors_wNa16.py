@@ -217,13 +217,52 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         device = getattr(layer, self.w_q_name).device
         c = self.kernel_config
 
-        check_marlin_supports_shape(
+        marlin_ok, marlin_err = check_marlin_supports_shape(
             c.partition_weight_shape[1],  # out_features
             c.partition_weight_shape[0],  # in_features
             c.full_weight_shape[0],  # in_features
             c.group_size,
         )
 
+        # Fallback: for shapes not supported by marlin (e.g. small gates with
+        # out_features < 64), dequantize weights to fp16 and use plain linear.
+        if not marlin_ok:
+            logger.debug(
+                "Layer with shape %s does not support marlin: %s. "
+                "Falling back to dequantized fp16 linear.",
+                c.partition_weight_shape,
+                marlin_err,
+            )
+            self.marlin_supported = False
+            # Dequantize: w_q is packed int4, w_s is scale per group.
+            # Unpack to fp16 for this small layer.
+            w_packed = getattr(layer, self.w_q_name).data  # [out, in//pack]
+            w_scale = getattr(layer, self.w_s_name).data   # [out, num_groups]
+            num_bits = c.weight_type.size_bits
+            pack_factor = 32 // num_bits
+            out_size, in_packed = w_packed.shape
+            in_size = in_packed * pack_factor
+            # Unpack int4 packed weights to int32
+            shifts = torch.arange(0, 32, num_bits, device=device)
+            masks = (1 << num_bits) - 1
+            w_int = ((w_packed.unsqueeze(-1) >> shifts) & masks).reshape(out_size, in_size)
+            # Convert to signed: for uint4b8 offset is 8, for uint8b128 offset is 128
+            offset = 1 << (num_bits - 1)
+            w_int = w_int.to(torch.float16) - offset
+            # Apply scales: w_scale shape is [out, num_groups], group_size=in_size//num_groups
+            group_size = c.group_size if c.group_size != -1 else in_size
+            num_groups = in_size // group_size
+            w_scale_expanded = w_scale[:, :num_groups].repeat_interleave(group_size, dim=1)
+            if w_scale_expanded.shape[1] != in_size:
+                w_scale_expanded = w_scale_expanded[:, :in_size]
+            w_dequant = (w_int * w_scale_expanded.to(torch.float16)).to(c.act_type)
+            replace_parameter(
+                layer, self.w_q_name,
+                torch.nn.Parameter(w_dequant, requires_grad=False)
+            )
+            return
+
+        self.marlin_supported = True
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
@@ -320,6 +359,11 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             )
 
         w_q, w_s, w_zp, w_gidx = _get_weight_params(layer)
+
+        # Small-layer fallback: w_q was dequantized to fp16 in
+        # process_weights_after_loading, so just call plain linear.
+        if not getattr(self, "marlin_supported", True):
+            return torch.nn.functional.linear(x, w_q, bias)
 
         # `process_weights_after_loading` will ensure w_zp and w_gidx are not
         #  None for marlin

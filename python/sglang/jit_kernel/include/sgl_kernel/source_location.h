@@ -1,5 +1,10 @@
 #pragma once
+
+#if defined(__has_include)
+#if __has_include(<version>)
 #include <version>
+#endif
+#endif
 
 /// NOTE: fallback to a minimal source_location implementation
 #if defined(__cpp_lib_source_location)

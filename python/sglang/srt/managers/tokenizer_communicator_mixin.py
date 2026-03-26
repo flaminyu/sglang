@@ -30,6 +30,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+        ContinuumWorkerKVEvictReqInput,
+        ContinuumWorkerKVEvictReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -238,6 +240,9 @@ class TokenizerCommunicatorMixin:
         self.dumper_control_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.continuum_worker_kv_evict_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -340,11 +345,38 @@ class TokenizerCommunicatorMixin:
                     DumperControlReqOutput,
                     self.dumper_control_communicator.handle_recv,
                 ),
+                (
+                    ContinuumWorkerKVEvictReqOutput,
+                    self.continuum_worker_kv_evict_communicator.handle_recv,
+                ),
             ]
         )
 
     async def flush_cache(self: TokenizerManager) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+
+    async def continuum_evict_worker_kv_hard(
+        self: TokenizerManager,
+        worker_id: str,
+    ) -> ContinuumWorkerKVEvictReqOutput:
+        results = await self.continuum_worker_kv_evict_communicator(
+            ContinuumWorkerKVEvictReqInput(worker_id=worker_id)
+        )
+
+        all_success = all([r.success for r in results])
+        total_nodes = sum(int(r.num_nodes_removed or 0) for r in results)
+        total_device = sum(int(r.num_device_tokens_evicted or 0) for r in results)
+        total_host = sum(int(r.num_host_tokens_evicted or 0) for r in results)
+        messages = " | ".join(str(r.message or "") for r in results if r.message)
+
+        return ContinuumWorkerKVEvictReqOutput(
+            success=all_success,
+            worker_id=worker_id,
+            num_nodes_removed=total_nodes,
+            num_device_tokens_evicted=total_device,
+            num_host_tokens_evicted=total_host,
+            message=messages,
+        )
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

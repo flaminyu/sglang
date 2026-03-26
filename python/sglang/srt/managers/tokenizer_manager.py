@@ -18,6 +18,7 @@ import copy
 import dataclasses
 import json
 import logging
+import math
 import os
 import pickle
 import signal
@@ -81,6 +82,11 @@ from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
 )
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+from sglang.srt.observability.continuum_kv_trace import (
+    get_namespace_trace,
+    register_namespace_request,
+    register_namespace_response,
+)
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     calibrate_time_diff,
@@ -330,6 +336,101 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.event_loop = None
         self.asyncio_tasks = set()
 
+        # Continuum-style worker KV control (experimental)
+        # worker_id -> policy state for worker-scoped KV control.
+        self._continuum_worker_kv_state: Dict[str, Dict[str, Any]] = {}
+        self._continuum_worker_kv_lock = threading.Lock()
+        self._continuum_history_lock = threading.Lock()
+        self._continuum_request_context_by_rid: Dict[str, Dict[str, Any]] = {}
+        self._continuum_program_stats: Dict[str, Dict[str, Any]] = {}
+        ttl_history_maxlen = max(
+            64,
+            int(os.getenv("SGLANG_CONTINUUM_TTL_HISTORY_MAXLEN", "4096") or 4096),
+        )
+        self._continuum_ttl_default_sec = max(
+            0.5,
+            float(os.getenv("SGLANG_CONTINUUM_TTL_DEFAULT_SEC", "15") or 15.0),
+        )
+        self._continuum_ttl_min_sec = max(
+            0.25,
+            float(os.getenv("SGLANG_CONTINUUM_TTL_MIN_SEC", "2") or 2.0),
+        )
+        self._continuum_ttl_max_sec = max(
+            self._continuum_ttl_min_sec,
+            float(os.getenv("SGLANG_CONTINUUM_TTL_MAX_SEC", "90") or 90.0),
+        )
+        # Tool-delay-aware TTL: if tool delay is known, override default TTL.
+        # TTL = max(tool_delay_sec × ratio, default_ttl, min_ttl)
+        # This ensures KV survives tool execution + buffer before spilling.
+        self._continuum_tool_delay_sec = max(
+            0.0,
+            float(os.getenv("SGLANG_CONTINUUM_TTL_TOOL_DELAY_SEC", "0") or 0.0),
+        )
+        self._continuum_tool_delay_ratio = max(
+            1.0,
+            float(os.getenv("SGLANG_CONTINUUM_TTL_TOOL_DELAY_RATIO", "1.5") or 1.5),
+        )
+        if self._continuum_tool_delay_sec > 0:
+            # Override default_ttl with tool-aware value as the floor
+            tool_aware_ttl = self._continuum_tool_delay_sec * self._continuum_tool_delay_ratio
+            self._continuum_ttl_default_sec = max(
+                self._continuum_ttl_default_sec,
+                tool_aware_ttl,
+            )
+            logger.info(
+                "[Continuum] Tool-delay-aware TTL: tool_delay=%.2fs ratio=%.2f → default_ttl=%.2fs (was %.2fs)",
+                self._continuum_tool_delay_sec,
+                self._continuum_tool_delay_ratio,
+                self._continuum_ttl_default_sec,
+                tool_aware_ttl,
+            )
+        self._continuum_ttl_history_threshold = max(
+            1,
+            int(os.getenv("SGLANG_CONTINUUM_TTL_HISTORY_THRESHOLD", "20") or 20),
+        )
+        self._continuum_prefill_throughput = max(
+            1.0,
+            float(os.getenv("SGLANG_CONTINUUM_PREFILL_THROUGHPUT", "1600") or 1600.0),
+        )
+        self._continuum_queue_avg_cap_sec = max(
+            0.0,
+            float(os.getenv("SGLANG_CONTINUUM_QUEUE_AVG_CAP_SEC", "0") or 0.0),
+        )
+        # Paper-style: add minimum queue delay to simulate scheduling overhead
+        self._continuum_queue_avg_min_sec = max(
+            0.0,
+            float(os.getenv("SGLANG_CONTINUUM_QUEUE_AVG_MIN_SEC", "0") or 0.0),
+        )
+        self._continuum_queue_avg_weight = max(
+            0.0,
+            float(os.getenv("SGLANG_CONTINUUM_QUEUE_AVG_WEIGHT", "1.0") or 1.0),
+        )
+        self._continuum_memory_pressure_penalty = max(
+            0.0,
+            float(os.getenv("SGLANG_CONTINUUM_MEMORY_PRESSURE_PENALTY", "0.3") or 0.3),
+        )
+        self._continuum_real_memory_enabled = get_bool_env_var(
+            "SGLANG_CONTINUUM_REAL_MEMORY", "false"
+        )
+        self._continuum_last_memory_check = 0.0
+        self._continuum_last_memory_usage = 0.0
+        self._continuum_global_idle_gap_history: deque[float] = deque(
+            maxlen=ttl_history_maxlen
+        )
+        self._continuum_global_queue_time_history: deque[float] = deque(
+            maxlen=ttl_history_maxlen
+        )
+        self._continuum_global_e2e_history: deque[float] = deque(
+            maxlen=ttl_history_maxlen
+        )
+        self._continuum_ttl_stop = threading.Event()
+        self._continuum_ttl_thread = threading.Thread(
+            target=self._continuum_ttl_loop,
+            name="continuum-worker-kv-ttl",
+            daemon=True,
+        )
+        self._continuum_ttl_thread.start()
+
         # Health check
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
@@ -341,6 +442,576 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
+
+    def _continuum_default_worker_kv_state(self) -> Dict[str, Any]:
+        return {
+            "mode": "spill_cpu",
+            "epoch": 0,
+            "priority": None,
+            "policy": "spill_cpu",
+            "ttl_sec": None,
+            "computed_ttl_sec": None,
+            "ttl_source": "fixed",
+            "last_touch_ts": None,
+            "active_mode": "pin_gpu",
+            "idle_mode": "spill_cpu",
+            "last_program_id": None,
+            "last_tool_name": None,
+        }
+
+    def _continuum_get_program_stats(self, program_id: str) -> Dict[str, Any]:
+        return self._continuum_program_stats.setdefault(
+            program_id,
+            {
+                "idle_gaps": deque(maxlen=self._continuum_global_idle_gap_history.maxlen),
+                "turn_pairs": deque(maxlen=256),
+                "last_finish_ts": None,
+                "last_gap_origin_finish_ts": None,
+                # Per-tool duration tracking for Continuum paper's P(τ,f) formula
+                "tool_durations": {},  # tool_name -> deque of durations
+                "tool_finish_ts": {},  # tool_name -> last finish timestamp
+            },
+        )
+
+    def _continuum_get_request_context(
+        self, req: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> Dict[str, Any]:
+        rid = getattr(req, "rid", None)
+        if not isinstance(rid, str) or not rid:
+            return {}
+        with self._continuum_history_lock:
+            ctx = self._continuum_request_context_by_rid.get(rid)
+            return copy.deepcopy(ctx) if ctx else {}
+
+    def _continuum_prompt_excerpt(
+        self, req: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> str:
+        text = getattr(req, "text", None)
+        if isinstance(text, list):
+            text = text[0] if text else ""
+        if not text:
+            input_ids = getattr(req, "input_ids", None)
+            if isinstance(input_ids, list):
+                if input_ids and isinstance(input_ids[0], list):
+                    return f"input_ids:{len(input_ids[0])}"
+                return f"input_ids:{len(input_ids)}"
+            return ""
+        normalized = " ".join(str(text).split())
+        if len(normalized) <= 240:
+            return normalized
+        return normalized[:237] + "..."
+
+    def _continuum_normalize_request_context(
+        self,
+        request_context: Optional[Dict[str, Any]],
+        worker_id: str,
+        req: Union[GenerateReqInput, EmbeddingReqInput],
+    ) -> Dict[str, Any]:
+        raw_ctx = dict(request_context or {})
+        program_id = str(raw_ctx.get("program_id") or getattr(req, "conversation_id", "") or worker_id).strip()
+        tool_name = str(raw_ctx.get("tool_name") or "").strip() or None
+        task_type = str(raw_ctx.get("task_type") or "").strip() or None
+        turn_index = raw_ctx.get("turn_index")
+        turn_count = raw_ctx.get("turn_count")
+        try:
+            turn_index = int(turn_index) if turn_index is not None else None
+        except Exception:
+            turn_index = None
+        try:
+            turn_count = int(turn_count) if turn_count is not None else None
+        except Exception:
+            turn_count = None
+        return {
+            "worker_id": worker_id,
+            "program_id": program_id or worker_id,
+            "tool_name": tool_name,
+            "task_type": task_type,
+            "turn_index": turn_index,
+            "turn_count": turn_count,
+        }
+
+    def _continuum_mean(self, values: List[float]) -> float:
+        return float(sum(values) / len(values)) if values else 0.0
+
+    def _continuum_memoryfulness_eta(self, samples: List[Tuple[float, float]]) -> float:
+        if len(samples) < 3:
+            return 1.0
+        xs = [float(x) for x, _ in samples]
+        ys = [float(y) for _, y in samples]
+        mean_x = self._continuum_mean(xs)
+        mean_y = self._continuum_mean(ys)
+        var_x = sum((x - mean_x) ** 2 for x in xs)
+        var_y = sum((y - mean_y) ** 2 for y in ys)
+        if var_x <= 1e-12 or var_y <= 1e-12:
+            return 1.0
+        cov = sum((x - mean_x) * (y - mean_y) for x, y in samples)
+        corr = cov / math.sqrt(var_x * var_y)
+        eta = -corr
+        return max(0.1, min(2.0, eta))
+
+    def _continuum_select_dynamic_ttl(
+        self,
+        worker_id: str,
+        req: Union[GenerateReqInput, EmbeddingReqInput],
+        prospective_extra_key: str,
+        ctx: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[float, str, Dict[str, Any]]:
+        """
+        Select optimal TTL using Continuum paper's Utility Model.
+
+        Paper formula: τ* = argmax_τ P(τ, f) × (T·η + Prefill-Reload) - (MemUsage/M) × τ
+
+        Where:
+        - P(τ, f) = empirical CDF of tool f execution time ≤ τ
+        - T = average queueing delay per unit memory
+        - η = memoryfulness factor = -Corr(k, N-k)
+        - Prefill-Reload = profiled prefill or CPU reload time
+        - MemUsage/M = relative memory usage
+        """
+        default_ttl = self._continuum_ttl_default_sec
+        with self._continuum_worker_kv_lock:
+            state = self._continuum_worker_kv_state.get(worker_id)
+            if state is not None and state.get("ttl_sec") is not None:
+                default_ttl = max(float(state.get("ttl_sec") or default_ttl), 0.5)
+
+        if not ctx:
+            ctx = self._continuum_get_request_context(req)
+        program_id = str(ctx.get("program_id") or worker_id)
+        tool_name = ctx.get("tool_name")  # Per-tool tracking
+        namespace_trace = get_namespace_trace(prospective_extra_key)
+        now = real_time()
+
+        with self._continuum_history_lock:
+            prog_stats = self._continuum_get_program_stats(program_id)
+            last_finish_ts = prog_stats.get("last_finish_ts")
+            if (
+                isinstance(last_finish_ts, (float, int))
+                and last_finish_ts > 0.0
+                and prog_stats.get("last_gap_origin_finish_ts") != last_finish_ts
+            ):
+                idle_gap = max(0.0, now - float(last_finish_ts))
+                prog_stats["idle_gaps"].append(idle_gap)
+                self._continuum_global_idle_gap_history.append(idle_gap)
+                prog_stats["last_gap_origin_finish_ts"] = float(last_finish_ts)
+
+                # Track per-tool duration for Continuum paper's P(τ,f)
+                if tool_name:
+                    tool_durations = prog_stats.get("tool_durations", {})
+                    if tool_name not in tool_durations:
+                        tool_durations[tool_name] = deque(maxlen=1024)
+                    tool_durations[tool_name].append(idle_gap)
+                    prog_stats["tool_durations"] = tool_durations
+
+            # Use per-tool CDF if available (Continuum paper's approach)
+            local_samples = []
+            ttl_source = "default"
+            if tool_name:
+                tool_durations = prog_stats.get("tool_durations", {})
+                tool_samples = list(tool_durations.get(tool_name, []))
+                if len(tool_samples) >= self._continuum_ttl_history_threshold:
+                    local_samples = tool_samples
+                    ttl_source = f"tool_cdf:{tool_name}"
+                elif self._continuum_global_idle_gap_history:
+                    local_samples = list(self._continuum_global_idle_gap_history)
+                    ttl_source = "global_cdf"
+            elif len(prog_stats["idle_gaps"]) >= self._continuum_ttl_history_threshold:
+                local_samples = list(prog_stats["idle_gaps"])
+                ttl_source = "program_cdf"
+            elif self._continuum_global_idle_gap_history:
+                local_samples = list(self._continuum_global_idle_gap_history)
+                ttl_source = "global_cdf"
+
+            queue_avg = self._continuum_mean(list(self._continuum_global_queue_time_history))
+            active_progs = 0
+            if queue_avg <= 0.0:
+                now_ts = real_time()
+                active_progs = sum(
+                    1
+                    for s in self._continuum_program_stats.values()
+                    if now_ts - float(s.get("last_finish_ts") or 0.0) < 60.0
+                )
+                if active_progs > 1:
+                    e2e_list = list(self._continuum_global_e2e_history)
+                    if e2e_list:
+                        avg_e2e = sum(e2e_list) / len(e2e_list)
+                        contention_factor = max(0.0, (active_progs - 1.0)) / max(active_progs, 1.0)
+                        queue_avg = avg_e2e * contention_factor
+            else:
+                now_ts = real_time()
+                active_progs = sum(
+                    1
+                    for s in self._continuum_program_stats.values()
+                    if now_ts - float(s.get("last_finish_ts") or 0.0) < 60.0
+                )
+            eta = self._continuum_memoryfulness_eta(list(prog_stats["turn_pairs"]))
+
+        reload_benefit = float(namespace_trace.get("last_load_back_duration_sec") or 0.0)
+        estimated_tokens = 0
+        input_ids = getattr(req, "input_ids", None)
+        if isinstance(input_ids, list):
+            if input_ids and isinstance(input_ids[0], list):
+                estimated_tokens = len(input_ids[0])
+            else:
+                estimated_tokens = len(input_ids)
+        if estimated_tokens <= 0:
+            text = getattr(req, "text", None)
+            if isinstance(text, list):
+                text = text[0] if text else ""
+            text_len = len(str(text)) if text else 0
+            estimated_tokens = max(1, text_len // 4)
+        if reload_benefit <= 0.0:
+            reload_benefit = max(estimated_tokens, 1) / self._continuum_prefill_throughput
+
+        # Continuum paper utility model: Benefit = T·η + Prefill-Reload
+        queue_component = queue_avg
+        if self._continuum_queue_avg_cap_sec > 0.0:
+            queue_component = min(queue_component, self._continuum_queue_avg_cap_sec)
+        # Paper-style minimum queue delay: ensures non-zero benefit even without real queueing
+        if self._continuum_queue_avg_min_sec > 0.0:
+            queue_component = max(queue_component, self._continuum_queue_avg_min_sec)
+        queue_component *= self._continuum_queue_avg_weight
+        benefit = max(0.0, queue_component * eta + reload_benefit)
+
+        # Continuum paper cost model: Cost = (MemUsage/M) × τ
+        # Using real GPU memory usage if enabled, otherwise estimate from token budget
+        if self._continuum_real_memory_enabled:
+            # Poll real GPU memory usage periodically (every 1 second)
+            now = real_time()
+            if now - self._continuum_last_memory_check > 1.0:
+                self._continuum_last_memory_check = now
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        allocated = torch.cuda.memory_allocated() / (1024**3)  # GB
+                        reserved = torch.cuda.memory_reserved() / (1024**3)  # GB
+                        # Get total GPU memory
+                        total = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+                        # Get model memory from server args
+                        mem_fraction = getattr(self.server_args, "mem_fraction_static", 0.8)
+                        total_kv_mem = total * mem_fraction
+                        # Real memory pressure = (weight + kv_cache) / total_available
+                        self._continuum_last_memory_usage = min(1.0, allocated / total)
+                except Exception:
+                    self._continuum_last_memory_usage = 0.5  # fallback
+            estimated_memory_pressure = self._continuum_last_memory_usage
+        else:
+            # Original estimation: active_progs * estimated_tokens / token_budget
+            token_budget = max(float(getattr(self.server_args, "max_total_tokens", 0) or 0.0), 1.0)
+            estimated_memory_pressure = min(
+                1.0,
+                (max(active_progs, 1) * max(float(estimated_tokens), 1.0)) / token_budget,
+            )
+        # Paper's memory cost coefficient: (MemUsage/M) × τ
+        # Our ttl_cost_multiplier approximates this
+        ttl_cost_multiplier = 1.0 + self._continuum_memory_pressure_penalty * estimated_memory_pressure
+
+        if not local_samples:
+            return (
+                max(self._continuum_ttl_min_sec, min(default_ttl, self._continuum_ttl_max_sec)),
+                ttl_source,
+                {
+                    "sample_count": 0,
+                    "queue_avg": round(queue_avg, 6),
+                    "queue_component": round(queue_component, 6),
+                    "eta": round(eta, 6),
+                    "reload_benefit": round(reload_benefit, 6),
+                    "benefit": round(benefit, 6),
+                    "active_progs": int(active_progs),
+                    "estimated_tokens": int(estimated_tokens),
+                    "estimated_memory_pressure": round(estimated_memory_pressure, 6),
+                    "ttl_cost_multiplier": round(ttl_cost_multiplier, 6),
+                    "tool_name": tool_name,
+                },
+            )
+
+        # Ensure candidates span meaningful TTL range based on reload cost
+        effective_min_sec = self._continuum_ttl_min_sec
+        if reload_benefit > 0.5:
+            reload_floor_candidates = {
+                max(self._continuum_ttl_min_sec, min(reload_benefit * 2.0, self._continuum_ttl_max_sec)),
+                max(self._continuum_ttl_min_sec, min(reload_benefit * 4.0, self._continuum_ttl_max_sec)),
+            }
+        else:
+            reload_floor_candidates = set()
+
+        candidate_ttls = sorted(
+            {
+                max(effective_min_sec, min(float(sample), self._continuum_ttl_max_sec))
+                for sample in local_samples
+                if float(sample) > 0.0
+            }
+            | {
+                max(effective_min_sec, min(default_ttl, self._continuum_ttl_max_sec))
+            }
+            | reload_floor_candidates
+        )
+
+        # Paper formula: score = P(τ, f) × benefit - cost
+        # Where P(τ, f) is the CDF: probability that tool f finishes ≤ τ
+        best_ttl = candidate_ttls[0]
+        best_score = float("-inf")
+        for candidate in candidate_ttls:
+            # P(τ, f) = probability tool finishes within τ
+            probability = sum(1 for sample in local_samples if sample <= candidate) / len(local_samples)
+
+            # Reload penalty: TTL < reload_benefit causes thrash
+            reload_penalty = reload_benefit * 2.0 if candidate < reload_benefit else 0.0
+
+            # Paper's utility: P(τ,f) × benefit - cost
+            # Cost = (MemUsage/M) × τ ≈ ttl_cost_multiplier × τ
+            score = probability * benefit - candidate * ttl_cost_multiplier - reload_penalty
+
+            if score > best_score or (
+                abs(score - best_score) <= 1e-9 and candidate < best_ttl
+            ):
+                best_ttl = candidate
+                best_score = score
+
+        return (
+            max(self._continuum_ttl_min_sec, min(best_ttl, self._continuum_ttl_max_sec)),
+            ttl_source,
+            {
+                "sample_count": len(local_samples),
+                "queue_avg": round(queue_avg, 6),
+                "queue_component": round(queue_component, 6),
+                "eta": round(eta, 6),
+                "reload_benefit": round(reload_benefit, 6),
+                "benefit": round(benefit, 6),
+                "best_score": round(best_score, 6),
+                "active_progs": int(active_progs),
+                "estimated_tokens": int(estimated_tokens),
+                "estimated_memory_pressure": round(estimated_memory_pressure, 6),
+                "ttl_cost_multiplier": round(ttl_cost_multiplier, 6),
+                "tool_name": tool_name,
+                # Tool-delay-aware TTL config (from env or default)
+                "tool_delay_sec": self._continuum_tool_delay_sec,
+                "tool_delay_ratio": self._continuum_tool_delay_ratio,
+            },
+        )
+
+    def _continuum_ttl_loop(self) -> None:
+        while not getattr(self, "gracefully_exit", False):
+            now = real_time()
+            with self._continuum_worker_kv_lock:
+                for state in self._continuum_worker_kv_state.values():
+                    if str(state.get("policy", "")) != "ttl_spill":
+                        continue
+                    ttl_sec = float(
+                        state.get("computed_ttl_sec")
+                        or state.get("ttl_sec")
+                        or 0.0
+                    )
+                    last_touch = float(state.get("last_touch_ts") or 0.0)
+                    idle_mode = str(state.get("idle_mode", "spill_cpu"))
+                    if ttl_sec <= 0.0 or last_touch <= 0.0:
+                        continue
+                    if now - last_touch >= ttl_sec and str(state.get("mode", "")) != idle_mode:
+                        state["mode"] = idle_mode
+            if self._continuum_ttl_stop.wait(0.5):
+                break
+
+    def continuum_get_worker_kv_state(self) -> Dict[str, Dict[str, Any]]:
+        with self._continuum_worker_kv_lock:
+            return copy.deepcopy(self._continuum_worker_kv_state)
+
+    def continuum_set_worker_kv_policy(
+        self,
+        worker_id: str,
+        action: str,
+        priority: Optional[int] = None,
+        ttl_sec: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        worker_id = (worker_id or "").strip()
+        if not worker_id:
+            raise ValueError("worker_id must not be empty")
+
+        action = (action or "").strip().lower()
+        if action not in {"pin_gpu", "spill_cpu", "evict_once", "ttl_spill"}:
+            raise ValueError("action must be one of: pin_gpu, spill_cpu, evict_once, ttl_spill")
+
+        with self._continuum_worker_kv_lock:
+            state = self._continuum_worker_kv_state.setdefault(
+                worker_id,
+                self._continuum_default_worker_kv_state(),
+            )
+
+            if action == "evict_once":
+                state["epoch"] = int(state.get("epoch", 0)) + 1
+                state["mode"] = "spill_cpu"
+                state["policy"] = "spill_cpu"
+                state["ttl_sec"] = None
+                state["last_touch_ts"] = None
+            elif action == "pin_gpu":
+                state["mode"] = "pin_gpu"
+                state["policy"] = "pin_gpu"
+                state["ttl_sec"] = None
+                state["last_touch_ts"] = real_time()
+            elif action == "spill_cpu":
+                state["mode"] = "spill_cpu"
+                state["policy"] = "spill_cpu"
+                state["ttl_sec"] = None
+                state["last_touch_ts"] = real_time()
+            elif action == "ttl_spill":
+                ttl_value = float(ttl_sec or 0.0)
+                state["policy"] = "ttl_spill"
+                state["ttl_sec"] = ttl_value if ttl_value > 0.0 else self._continuum_ttl_default_sec
+                state["computed_ttl_sec"] = state["ttl_sec"]
+                state["ttl_source"] = "default"
+                state["active_mode"] = "pin_gpu"
+                state["idle_mode"] = "spill_cpu"
+                state["mode"] = str(state.get("active_mode", "pin_gpu"))
+                state["last_touch_ts"] = real_time()
+
+            if priority is not None:
+                state["priority"] = int(priority)
+
+            return {
+                "worker_id": worker_id,
+                "action": action,
+                "policy": state.get("policy"),
+                "mode": state["mode"],
+                "epoch": int(state["epoch"]),
+                "priority": state.get("priority"),
+                "ttl_sec": state.get("ttl_sec"),
+                "computed_ttl_sec": state.get("computed_ttl_sec"),
+                "ttl_source": state.get("ttl_source"),
+                "last_touch_ts": state.get("last_touch_ts"),
+            }
+
+    def continuum_attach_request_context(
+        self,
+        req: Union[GenerateReqInput, EmbeddingReqInput],
+        worker_id: str,
+        request_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        ctx = self._continuum_normalize_request_context(request_context, worker_id, req)
+        rid = getattr(req, "rid", None)
+        if isinstance(rid, str) and rid:
+            with self._continuum_history_lock:
+                self._continuum_request_context_by_rid[rid] = copy.deepcopy(ctx)
+        if ctx.get("program_id") and getattr(req, "conversation_id", None) in {None, ""}:
+            req.conversation_id = ctx["program_id"]
+        return ctx
+
+    def continuum_apply_policy_to_request(
+        self,
+        req: Union[GenerateReqInput, EmbeddingReqInput],
+        worker_id: Optional[str],
+        request_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        worker_id = (worker_id or "").strip()
+        if not worker_id:
+            return
+
+        ctx = self.continuum_attach_request_context(req, worker_id, request_context)
+
+        with self._continuum_worker_kv_lock:
+            state = self._continuum_worker_kv_state.get(worker_id)
+
+            if state is None:
+                state = self._continuum_default_worker_kv_state()
+            elif str(state.get("policy", "")) == "ttl_spill":
+                state["mode"] = str(state.get("active_mode", "pin_gpu"))
+
+            state = copy.deepcopy(state)
+
+        mode = str(state.get("mode", "spill_cpu"))
+        epoch = int(state.get("epoch", 0))
+        explicit_priority = state.get("priority")
+        policy = str(state.get("policy", mode))
+
+        default_priority = -20 if mode == "pin_gpu" else 20
+        final_priority = (
+            int(explicit_priority) if explicit_priority is not None else default_priority
+        )
+
+        if policy == "ttl_spill":
+            suffix = f"__continuum_worker={worker_id}__policy=ttl_spill__epoch={epoch}"
+        else:
+            suffix = f"__continuum_worker={worker_id}__mode={mode}__epoch={epoch}"
+        base_extra_key = req.extra_key if isinstance(req.extra_key, str) else ""
+        req.extra_key = base_extra_key + suffix
+
+        if policy == "ttl_spill":
+            computed_ttl_sec, ttl_source, ttl_debug = self._continuum_select_dynamic_ttl(
+                worker_id,
+                req,
+                req.extra_key,
+                ctx=ctx,
+            )
+            state["computed_ttl_sec"] = computed_ttl_sec
+            state["ttl_source"] = ttl_source
+            state["last_touch_ts"] = real_time()
+            state["mode"] = str(state.get("active_mode", "pin_gpu"))
+            state["last_program_id"] = ctx.get("program_id")
+            state["last_tool_name"] = ctx.get("tool_name")
+            with self._continuum_worker_kv_lock:
+                live_state = self._continuum_worker_kv_state.setdefault(
+                    worker_id,
+                    self._continuum_default_worker_kv_state(),
+                )
+                live_state.update(
+                    {
+                        "computed_ttl_sec": computed_ttl_sec,
+                        "ttl_source": ttl_source,
+                        "last_touch_ts": state["last_touch_ts"],
+                        "mode": state["mode"],
+                        "last_program_id": ctx.get("program_id"),
+                        "last_tool_name": ctx.get("tool_name"),
+                    }
+                )
+            logger.info(
+                "CONTINUUM_TTL_DECISION %s",
+                json.dumps(
+                    {
+                        "worker_id": worker_id,
+                        "program_id": ctx.get("program_id"),
+                        "tool_name": ctx.get("tool_name"),
+                        "ttl_sec": round(computed_ttl_sec, 6),
+                        "ttl_source": ttl_source,
+                        **ttl_debug,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            )
+        else:
+            state["last_touch_ts"] = real_time()
+
+        if req.priority is None:
+            req.priority = final_priority
+
+        allowed = set(self.server_args.tokenizer_metrics_allowed_custom_labels or [])
+        continuum_labels = {
+            "continuum_worker_id": worker_id,
+            "continuum_kv_mode": mode,
+            "continuum_kv_epoch": str(epoch),
+        }
+        if ctx.get("program_id"):
+            continuum_labels["continuum_program_id"] = str(ctx["program_id"])
+        if ctx.get("tool_name"):
+            continuum_labels["continuum_tool_name"] = str(ctx["tool_name"])
+        if allowed:
+            continuum_labels = {
+                key: value for key, value in continuum_labels.items() if key in allowed
+            }
+            if continuum_labels:
+                if req.custom_labels is None:
+                    req.custom_labels = {}
+                req.custom_labels.update(continuum_labels)
+
+        register_namespace_request(
+            req.extra_key,
+            worker_id=worker_id,
+            program_id=ctx.get("program_id"),
+            tool_name=ctx.get("tool_name"),
+            task_type=ctx.get("task_type"),
+            prompt_text=self._continuum_prompt_excerpt(req),
+            turn_index=ctx.get("turn_index"),
+            turn_count=ctx.get("turn_count"),
+            ttl_sec=state.get("computed_ttl_sec") if policy == "ttl_spill" else None,
+            ttl_source=state.get("ttl_source") if policy == "ttl_spill" else policy,
+        )
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -1565,11 +2236,72 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
+                request_context = self._continuum_get_request_context(state.obj)
                 state.time_stats.trace_ctx.trace_set_root_attrs(
                     self.convert_to_span_attrs(state, recv_obj, i)
                 )
                 state.time_stats.set_finished_time()
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
+
+                e2e_val = meta_info.get("e2e_latency")
+                if isinstance(e2e_val, (float, int)) and e2e_val > 0:
+                    with self._continuum_history_lock:
+                        self._continuum_global_e2e_history.append(float(e2e_val))
+
+                queueing_sec = None
+                if recv_obj.time_stats is not None:
+                    try:
+                        queueing_sec = recv_obj.time_stats[i].get_queueing_time()
+                    except Exception as exc:
+                        if not getattr(self, "_continuum_queue_warn_logged", False):
+                            logger.warning("[Continuum] get_queueing_time() failed: %s", exc)
+                            self._continuum_queue_warn_logged = True
+                        queueing_sec = None
+                else:
+                    if not getattr(self, "_continuum_queue_none_logged", False):
+                        logger.warning("[Continuum] recv_obj.time_stats is None — queue time tracking unavailable")
+                        self._continuum_queue_none_logged = True
+
+                if isinstance(queueing_sec, (float, int)) and queueing_sec >= 0.0:
+                    with self._continuum_history_lock:
+                        self._continuum_global_queue_time_history.append(float(queueing_sec))
+                        # Log queue tracking periodically
+                        qlen = len(self._continuum_global_queue_time_history)
+                        if qlen in (1, 10, 50) or qlen % 100 == 0:
+                            vals = list(self._continuum_global_queue_time_history)
+                            avg_q = sum(vals) / len(vals) if vals else 0.0
+                            logger.info(
+                                "[Continuum] queue_time tracking: count=%d avg=%.4f last=%.4f",
+                                qlen, avg_q, queueing_sec,
+                            )
+                        self._continuum_global_queue_time_history.append(float(queueing_sec))
+
+                program_id = str(
+                    request_context.get("program_id")
+                    or getattr(state.obj, "conversation_id", "")
+                    or ""
+                ).strip()
+                if program_id:
+                    with self._continuum_history_lock:
+                        prog_stats = self._continuum_get_program_stats(program_id)
+                        prog_stats["last_finish_ts"] = real_time()
+                        turn_index = request_context.get("turn_index")
+                        turn_count = request_context.get("turn_count")
+                        if (
+                            isinstance(turn_index, int)
+                            and isinstance(turn_count, int)
+                            and turn_count >= turn_index >= 0
+                        ):
+                            prog_stats["turn_pairs"].append(
+                                (float(turn_index), float(turn_count - turn_index))
+                            )
+
+                register_namespace_response(
+                    getattr(state.obj, "extra_key", None),
+                    output_text=out_dict.get("text") if isinstance(out_dict, dict) else None,
+                    queueing_sec=queueing_sec,
+                    e2e_latency=meta_info.get("e2e_latency"),
+                )
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
@@ -1590,6 +2322,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         )
                     )
 
+                rid_key = rid if isinstance(rid, str) else None
+                if rid_key:
+                    with self._continuum_history_lock:
+                        self._continuum_request_context_by_rid.pop(rid_key, None)
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
@@ -1867,11 +2603,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
 
         custom_labels = getattr(state.obj, "custom_labels", None)
-        labels = (
-            {**self.metrics_collector.labels, **custom_labels}
-            if custom_labels
-            else self.metrics_collector.labels
-        )
+        if custom_labels:
+            registered_keys = set(self.metrics_collector.labels.keys())
+            filtered = {k: v for k, v in custom_labels.items() if k in registered_keys}
+            labels = {**self.metrics_collector.labels, **filtered}
+        else:
+            labels = self.metrics_collector.labels
         if (
             state.time_stats.first_token_time == 0.0
             and self.disaggregation_mode != DisaggregationMode.PREFILL

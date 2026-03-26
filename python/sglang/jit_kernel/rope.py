@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -11,10 +12,37 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+logger = logging.getLogger(__name__)
+_jit_rope_disabled = False
+
+
+def _apply_rope_torch_fallback(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    is_neox: bool,
+    rope_dim: int,
+) -> None:
+    pos = positions.to(torch.long)
+    rope_dim = rope_dim or cos_sin_cache.size(-1)
+    half_dim = rope_dim // 2
+    cos_sin = cos_sin_cache.index_select(0, pos)
+    cos = cos_sin[:, :half_dim]
+    sin = cos_sin[:, half_dim:rope_dim]
+
+    q_rope = q[..., :rope_dim]
+    k_rope = k[..., :rope_dim]
+    q[..., :rope_dim] = apply_rotary_emb(q_rope, cos, sin, is_neox)
+    k[..., :rope_dim] = apply_rotary_emb(k_rope, cos, sin, is_neox)
 
 
 @cache_once
@@ -73,9 +101,26 @@ def apply_rope_inplace(
         is_neox: Whether to use GPT-NeoX style (True) or GPT-J interleaved style (False).
         rope_dim: Rotary embedding dimension. Defaults to cos_sin_cache.size(-1).
     """
+    global _jit_rope_disabled
     rope_dim = rope_dim or cos_sin_cache.size(-1)
-    module = _jit_fused_rope_module(is_neox, rope_dim, q.dtype)
-    module.run_rope(q, k, cos_sin_cache, positions)
+    if _jit_rope_disabled:
+        _apply_rope_torch_fallback(
+            q, k, cos_sin_cache, positions, is_neox=is_neox, rope_dim=rope_dim
+        )
+        return
+
+    try:
+        module = _jit_fused_rope_module(is_neox, rope_dim, q.dtype)
+        module.run_rope(q, k, cos_sin_cache, positions)
+    except Exception as exc:
+        _jit_rope_disabled = True
+        logger.warning(
+            "Failed to load/run JIT fused rope kernel. Falling back to torch implementation. error=%s",
+            exc,
+        )
+        _apply_rope_torch_fallback(
+            q, k, cos_sin_cache, positions, is_neox=is_neox, rope_dim=rope_dim
+        )
 
 
 @register_custom_op(mutates_args=["q", "k_cache", "v_cache"])
@@ -110,10 +155,32 @@ def apply_rope_inplace_with_kvcache(
         is_neox: Whether to use GPT-NeoX style (True) or GPT-J interleaved (False).
         rope_dim: Rotary embedding dimension. Defaults to cos_sin_cache.size(-1).
     """
+    global _jit_rope_disabled
     rope_dim = rope_dim or cos_sin_cache.size(-1)
     v = v.view_as(k)
-    module = _jit_fused_rope_module(is_neox, rope_dim, q.dtype)
-    module.run_rope_store(q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc)
+
+    if _jit_rope_disabled:
+        _apply_rope_torch_fallback(
+            q, k, cos_sin_cache, positions, is_neox=is_neox, rope_dim=rope_dim
+        )
+        k_cache.index_copy_(0, out_loc.to(torch.long), k.reshape(k.shape[0], -1))
+        v_cache.index_copy_(0, out_loc.to(torch.long), v.reshape(v.shape[0], -1))
+        return
+
+    try:
+        module = _jit_fused_rope_module(is_neox, rope_dim, q.dtype)
+        module.run_rope_store(q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc)
+    except Exception as exc:
+        _jit_rope_disabled = True
+        logger.warning(
+            "Failed to load/run JIT fused rope+store kernel. Falling back to torch implementation. error=%s",
+            exc,
+        )
+        _apply_rope_torch_fallback(
+            q, k, cos_sin_cache, positions, is_neox=is_neox, rope_dim=rope_dim
+        )
+        k_cache.index_copy_(0, out_loc.to(torch.long), k.reshape(k.shape[0], -1))
+        v_cache.index_copy_(0, out_loc.to(torch.long), v.reshape(v.shape[0], -1))
 
 
 # NOTE: this name is intentionally set as the old kernel in `sgl_kernel`

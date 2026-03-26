@@ -268,3 +268,58 @@ class OpenAIServingBase(ABC):
         if raw_request is None:
             return None
         return raw_request.headers.get("x-smg-routing-key")
+
+    def extract_continuum_worker_id(self, raw_request: Optional[Request]) -> Optional[str]:
+        if raw_request is None:
+            return None
+        worker_id = raw_request.headers.get("x-continuum-worker-id")
+        if worker_id is None:
+            return None
+        worker_id = worker_id.strip()
+        return worker_id if worker_id else None
+
+    def extract_continuum_request_context(
+        self, raw_request: Optional[Request]
+    ) -> dict[str, Any]:
+        if raw_request is None:
+            return {}
+
+        def _read_text_header(name: str) -> Optional[str]:
+            value = raw_request.headers.get(name)
+            if value is None:
+                return None
+            value = value.strip()
+            return value or None
+
+        def _read_int_header(name: str) -> Optional[int]:
+            value = _read_text_header(name)
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except ValueError:
+                return None
+
+        return {
+            "program_id": _read_text_header("x-continuum-program-id"),
+            "tool_name": _read_text_header("x-continuum-tool-name"),
+            "task_type": _read_text_header("x-continuum-task-type"),
+            "turn_index": _read_int_header("x-continuum-turn-index"),
+            "turn_count": _read_int_header("x-continuum-turn-count"),
+        }
+
+    def apply_continuum_worker_policy(
+        self,
+        adapted_request: Union[GenerateReqInput, EmbeddingReqInput],
+        raw_request: Optional[Request],
+    ) -> None:
+        worker_id = self.extract_continuum_worker_id(raw_request)
+        if not worker_id:
+            return
+        request_context = self.extract_continuum_request_context(raw_request)
+        if hasattr(self.tokenizer_manager, "continuum_apply_policy_to_request"):
+            self.tokenizer_manager.continuum_apply_policy_to_request(
+                adapted_request,
+                worker_id,
+                request_context,
+            )

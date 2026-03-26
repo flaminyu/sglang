@@ -87,6 +87,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
     ContinueGenerationReqInput,
+    ContinuumWorkerKVEvictReqInput,
+    ContinuumWorkerKVEvictReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -1035,6 +1037,10 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
+                (
+                    ContinuumWorkerKVEvictReqInput,
+                    self.continuum_worker_kv_evict_wrapped,
+                ),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -1512,6 +1518,7 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                extra_key=recv_req.extra_key,
                 routing_key=recv_req.routing_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
@@ -2463,6 +2470,58 @@ class Scheduler(
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()
         return FlushCacheReqOutput(success=success)
+
+    def continuum_worker_kv_evict_wrapped(
+        self,
+        recv_req: ContinuumWorkerKVEvictReqInput,
+    ) -> ContinuumWorkerKVEvictReqOutput:
+        worker_id = (recv_req.worker_id or "").strip()
+        if not worker_id:
+            return ContinuumWorkerKVEvictReqOutput(
+                success=False,
+                worker_id=worker_id,
+                message="worker_id must not be empty",
+            )
+
+        if not self._is_idle_for_hicache_storage_op():
+            return ContinuumWorkerKVEvictReqOutput(
+                success=False,
+                worker_id=worker_id,
+                message=(
+                    "Reject hard-evict: scheduler is not idle. "
+                    f"#queue-req={len(self.waiting_queue)} "
+                    f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+
+        if not hasattr(self.tree_cache, "continuum_evict_worker_namespace"):
+            return ContinuumWorkerKVEvictReqOutput(
+                success=False,
+                worker_id=worker_id,
+                message="Current tree_cache implementation does not support worker hard-evict.",
+            )
+
+        try:
+            stats = self.tree_cache.continuum_evict_worker_namespace(worker_id)
+            return ContinuumWorkerKVEvictReqOutput(
+                success=True,
+                worker_id=worker_id,
+                num_nodes_removed=int(stats.get("num_nodes_removed", 0) or 0),
+                num_device_tokens_evicted=int(
+                    stats.get("num_device_tokens_evicted", 0) or 0
+                ),
+                num_host_tokens_evicted=int(
+                    stats.get("num_host_tokens_evicted", 0) or 0
+                ),
+                message=str(stats.get("message", "")),
+            )
+        except Exception as e:
+            logger.exception("continuum hard-evict failed")
+            return ContinuumWorkerKVEvictReqOutput(
+                success=False,
+                worker_id=worker_id,
+                message=str(e),
+            )
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:

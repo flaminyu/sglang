@@ -1257,6 +1257,88 @@ async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
         )
 
 
+@app.get("/continuum/worker-kv-policy")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def continuum_get_worker_kv_policy():
+    """Get current continuum worker KV policy table."""
+    state = _global_state.tokenizer_manager.continuum_get_worker_kv_state()
+    return ORJSONResponse({"workers": state}, status_code=HTTPStatus.OK)
+
+
+@app.put("/continuum/worker-kv-policy")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def continuum_set_worker_kv_policy(request: Request):
+    """Set continuum worker KV policy.
+
+    Body example:
+    {
+      "worker_id": "worker-1",
+            "action": "pin_gpu" | "spill_cpu" | "evict_once" | "ttl_spill",
+            "ttl_sec": 20,
+      "priority": -20
+    }
+    """
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return _create_error_response(e)
+
+    worker_id = payload.get("worker_id") if isinstance(payload, dict) else None
+    action = payload.get("action") if isinstance(payload, dict) else None
+    priority = payload.get("priority") if isinstance(payload, dict) else None
+    ttl_sec = payload.get("ttl_sec") if isinstance(payload, dict) else None
+
+    try:
+        ret = _global_state.tokenizer_manager.continuum_set_worker_kv_policy(
+            worker_id=worker_id,
+            action=action,
+            priority=priority,
+            ttl_sec=ttl_sec,
+        )
+        return ORJSONResponse(ret, status_code=HTTPStatus.OK)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post("/continuum/worker-kv-evict")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def continuum_worker_kv_evict(request: Request):
+    """Evict one worker's KV namespace by bumping epoch once."""
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return _create_error_response(e)
+
+    worker_id = payload.get("worker_id") if isinstance(payload, dict) else None
+    priority = payload.get("priority") if isinstance(payload, dict) else None
+
+    try:
+        soft_ret = _global_state.tokenizer_manager.continuum_set_worker_kv_policy(
+            worker_id=worker_id,
+            action="evict_once",
+            priority=priority,
+        )
+        hard_ret = await _global_state.tokenizer_manager.continuum_evict_worker_kv_hard(
+            worker_id=worker_id,
+        )
+        return ORJSONResponse(
+            {
+                "soft": soft_ret,
+                "hard": {
+                    "success": hard_ret.success,
+                    "worker_id": hard_ret.worker_id,
+                    "num_nodes_removed": hard_ret.num_nodes_removed,
+                    "num_device_tokens_evicted": hard_ret.num_device_tokens_evicted,
+                    "num_host_tokens_evicted": hard_ret.num_host_tokens_evicted,
+                    "message": hard_ret.message,
+                },
+            },
+            status_code=HTTPStatus.OK if hard_ret.success else HTTPStatus.BAD_REQUEST,
+        )
+    except Exception as e:
+        return _create_error_response(e)
+
+
 @app.api_route("/open_session", methods=["GET", "POST"])
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""

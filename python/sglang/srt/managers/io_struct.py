@@ -1175,6 +1175,21 @@ class FlushCacheReqOutput(BaseReq):
 
 
 @dataclass
+class ContinuumWorkerKVEvictReqInput(BaseReq):
+    worker_id: str
+
+
+@dataclass
+class ContinuumWorkerKVEvictReqOutput(BaseReq):
+    success: bool
+    worker_id: str
+    num_nodes_removed: int = 0
+    num_device_tokens_evicted: int = 0
+    num_host_tokens_evicted: int = 0
+    message: str = ""
+
+
+@dataclass
 class AttachHiCacheStorageReqInput(BaseReq):
     """Dynamically attach (enable) HiCache storage backend at runtime.
 

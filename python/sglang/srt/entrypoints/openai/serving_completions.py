@@ -123,6 +123,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             custom_logit_processor=request.custom_logit_processor,
         )
 
+        self.apply_continuum_worker_policy(adapted_request, raw_request)
+
         return adapted_request, request
 
     def _build_sampling_params(self, request: CompletionRequest) -> Dict[str, Any]:

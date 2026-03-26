@@ -13,6 +13,11 @@ if TYPE_CHECKING:
 # Constants matching device::marlin:: in marlin.cuh
 _MAX_THREAD_N = 256
 
+try:
+    from sgl_kernel import gptq_marlin_gemm as aot_gptq_marlin_gemm
+except ImportError:
+    aot_gptq_marlin_gemm = None
+
 
 @cache_once
 def _jit_gptq_marlin_module(dtype: torch.dtype) -> Module:
@@ -50,6 +55,27 @@ def gptq_marlin_gemm(
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
 ) -> torch.Tensor:
+    if aot_gptq_marlin_gemm is not None:
+        return aot_gptq_marlin_gemm(
+            a,
+            c,
+            b_q_weight,
+            b_scales,
+            global_scale,
+            b_zeros,
+            g_idx,
+            perm,
+            workspace,
+            b_q_type,
+            size_m,
+            size_n,
+            size_k,
+            is_k_full,
+            use_atomic_add,
+            use_fp32_reduce,
+            is_zp_float,
+        )
+
     device = a.device
 
     # Allocate output if not provided
