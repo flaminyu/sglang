@@ -114,6 +114,12 @@ class ModelRunnerKVCacheMixin:
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):
+        # Re-measure available GPU memory after the model has been loaded.
+        # The original measurement from init_torch_distributed was taken before
+        # weight loading, so it is stale. Using the post-load free memory directly
+        # as "rest_memory" avoids the reserve-formula double-counting that caused
+        # OOM on GPUs with heavy CUDA-context overhead (e.g. local workstations
+        # vs. clean cluster nodes).
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -140,13 +146,12 @@ class ModelRunnerKVCacheMixin:
 
         cell_size = self.get_cell_size_per_token(num_layers)
 
-        rest_memory = available_gpu_memory - total_gpu_memory * (
-            1 - self.mem_fraction_static
-        )
+        rest_memory = available_gpu_memory
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
-        return int(rest_memory * (1 << 30)) // cell_size
+        max_tokens = int(rest_memory * (1 << 30)) // cell_size
+        return max_tokens
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config

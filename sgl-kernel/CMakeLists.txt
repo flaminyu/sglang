@@ -6,8 +6,11 @@ include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 include(FetchContent)
 
 # CMake
-cmake_policy(SET CMP0169 OLD)
-cmake_policy(SET CMP0177 NEW)
+# CMP0169/CMP0177 are default in CMake 3.30+; skip to avoid scikit-build-core bundled
+# CMake 3.26.5 complaining: "Policy CMP0169/CMP0177 is not known to this version"
+# NOTE: If building with system CMake >=3.28, these can be re-enabled:
+# cmake_policy(SET CMP0169 OLD)
+# cmake_policy(SET CMP0177 NEW)
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
