@@ -76,6 +76,10 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
+from sglang.srt.managers.continuum_profiler import (
+    run_offline_profiling,
+    print_profiling_result,
+)
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
 from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
     TokenizerManagerMultiItemMixin,
@@ -390,8 +394,49 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         self._continuum_prefill_throughput = max(
             1.0,
-            float(os.getenv("SGLANG_CONTINUUM_PREFILL_THROUGHPUT", "1600") or 1600.0),
+            float(os.getenv("SGLANG_CONTINUUM_PREFILL_THROUGHPUT", "0") or 0.0),
         )
+        # Auto-run offline profiling if prefill throughput not set
+        if self._continuum_prefill_throughput <= 1.0:
+            try:
+                model_config = getattr(self, "model_config", None)
+                model_dict = None
+                if model_config is not None:
+                    model_dict = {
+                        "num_layers": getattr(model_config, "num_layers", 32),
+                        "hidden_size": getattr(model_config, "hidden_size", 4096),
+                        "num_attention_heads": getattr(model_config, "num_attention_heads", 32),
+                        "num_key_value_heads": getattr(model_config, "num_key_value_heads", 8),
+                        "vocab_size": getattr(model_config, "vocab_size", 32000),
+                        "intermediate_size": getattr(model_config, "intermediate_size", 14336),
+                        "max_position_embeddings": getattr(model_config, "max_position_embeddings", 8192),
+                    }
+                profiling_result = run_offline_profiling(
+                    model_name=getattr(self.server_args, "model_path", "unknown"),
+                    model_config=model_dict,
+                    mem_fraction_kv=getattr(self.server_args, "mem_fraction_static", 0.8) * 0.3,
+                )
+                self._continuum_prefill_throughput = profiling_result.prefill_throughput
+                # Set queue delay from profiling
+                if self._continuum_queue_avg_min_sec <= 0.0:
+                    self._continuum_queue_avg_min_sec = profiling_result.t_queue_delay
+                logger.info(
+                    "[Continuum] Auto-profiled parameters: "
+                    "prefill_throughput=%.1f tokens/s, "
+                    "T_queue_delay=%.4f ms, "
+                    "prefill_latency/token=%.4f ms",
+                    self._continuum_prefill_throughput,
+                    profiling_result.t_queue_delay * 1000,
+                    profiling_result.prefill_latency_per_token * 1000,
+                )
+                if hasattr(self, "_continuum_profiling_result"):
+                    self._continuum_profiling_result = profiling_result
+                print_profiling_result(profiling_result)
+            except Exception as e:
+                logger.warning(
+                    "[Continuum] Auto-profiling failed: %s. Using default values.", str(e)
+                )
+                self._continuum_prefill_throughput = 1600.0
         self._continuum_queue_avg_cap_sec = max(
             0.0,
             float(os.getenv("SGLANG_CONTINUUM_QUEUE_AVG_CAP_SEC", "0") or 0.0),
@@ -624,18 +669,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             queue_avg = self._continuum_mean(list(self._continuum_global_queue_time_history))
             active_progs = 0
             if queue_avg <= 0.0:
+                # No real queue history - use profiled T value instead of E2E
+                # Per Continuum paper: T is "average queueing delay per unit memory"
+                # NOT the full E2E time. E2E includes LLM + tool execution time.
+                queue_avg = self._continuum_queue_avg_min_sec
                 now_ts = real_time()
                 active_progs = sum(
                     1
                     for s in self._continuum_program_stats.values()
                     if now_ts - float(s.get("last_finish_ts") or 0.0) < 60.0
                 )
-                if active_progs > 1:
-                    e2e_list = list(self._continuum_global_e2e_history)
-                    if e2e_list:
-                        avg_e2e = sum(e2e_list) / len(e2e_list)
-                        contention_factor = max(0.0, (active_progs - 1.0)) / max(active_progs, 1.0)
-                        queue_avg = avg_e2e * contention_factor
             else:
                 now_ts = real_time()
                 active_progs = sum(

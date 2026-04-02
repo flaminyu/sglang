@@ -59,6 +59,9 @@ def _resolve_kernel_path() -> pathlib.Path:
 
 KERNEL_PATH = _resolve_kernel_path()
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
+
+KERNEL_PATH = _resolve_kernel_path()
+DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 DEFAULT_HIP_CFLAGS = [

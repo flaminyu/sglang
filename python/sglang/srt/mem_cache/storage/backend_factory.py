@@ -183,6 +183,9 @@ class StorageBackendFactory:
             return backend_class.from_env_config(bytes_per_page, dtype, storage_config)
         elif backend_name == "eic":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "local_dram":
+            # Local DRAM: pass storage_config for tp_rank/tp_size info
+            return backend_class(storage_config)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -220,4 +223,11 @@ StorageBackendFactory.register_backend(
     "eic",
     "sglang.srt.mem_cache.storage.eic.eic_storage",
     "EICStorage",
+)
+
+# Local DRAM backend for single-node setups (fast CPU backup)
+StorageBackendFactory.register_backend(
+    "local_dram",
+    "sglang.srt.mem_cache.storage.local_dram_backend",
+    "HiCacheLocalDRAM",
 )
