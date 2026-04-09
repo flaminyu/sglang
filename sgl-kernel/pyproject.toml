@@ -41,5 +41,5 @@ wheel.py-api = "cp310"
 wheel.license-files = []
 wheel.packages = ["python/sgl_kernel"]
 
-# Force nvcc to use GCC 14 as host compiler (required by PyTorch)
-cmake.define.CMAKE_CUDA_HOST_COMPILER = "/opt/rh/gcc-toolset-14/root/usr/bin/g++"
+# Force nvcc to use GCC as host compiler (required by PyTorch)
+cmake.define.CMAKE_CUDA_HOST_COMPILER = "/data/apps/gcc/11.4.0/bin/g++"

@@ -45,11 +45,14 @@ endif()
 find_package(Torch REQUIRED)
 clear_cuda_arches(CMAKE_FLAG)
 
+# GitHub mirror for China mainland
+set(GH_MIRROR "https://ghproxy.com")
+
 # Third Party repos
 # cutlass
 FetchContent_Declare(
     repo-cutlass
-    GIT_REPOSITORY https://github.com/NVIDIA/cutlass
+    GIT_REPOSITORY ${GH_MIRROR}/https://github.com/NVIDIA/cutlass
     GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
     GIT_SHALLOW    OFF
 )
@@ -58,7 +61,7 @@ FetchContent_Populate(repo-cutlass)
 # DeepGEMM
 FetchContent_Declare(
     repo-deepgemm
-    GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
+    GIT_REPOSITORY ${GH_MIRROR}/https://github.com/sgl-project/DeepGEMM
     GIT_TAG        ffe2b6b97420a9f8c58268ca55755168e6e2f360
     GIT_SHALLOW    OFF
 )
@@ -67,7 +70,7 @@ FetchContent_Populate(repo-deepgemm)
 # fmt
 FetchContent_Declare(
     repo-fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt
+    GIT_REPOSITORY ${GH_MIRROR}/https://github.com/fmtlib/fmt
     GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
     GIT_SHALLOW    OFF
 )
@@ -76,7 +79,7 @@ FetchContent_Populate(repo-fmt)
 # Triton kernel
 FetchContent_Declare(
     repo-triton
-    GIT_REPOSITORY "https://github.com/triton-lang/triton"
+    GIT_REPOSITORY ${GH_MIRROR}/https://github.com/triton-lang/triton
     GIT_TAG        v3.5.1
     GIT_SHALLOW    OFF
 )
@@ -85,7 +88,7 @@ FetchContent_Populate(repo-triton)
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
+    GIT_REPOSITORY ${GH_MIRROR}/https://github.com/flashinfer-ai/flashinfer.git
     GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
     GIT_SHALLOW    OFF
 )
@@ -94,7 +97,7 @@ FetchContent_Populate(repo-flashinfer)
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
+    GIT_REPOSITORY ${GH_MIRROR}/https://github.com/sgl-project/sgl-attn
     GIT_TAG        cc75c5c5979a607ad20a6828635646f9841acf01
     GIT_SHALLOW    OFF
 )
@@ -103,7 +106,7 @@ FetchContent_Populate(repo-flash-attention)
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
-    GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
+    GIT_REPOSITORY ${GH_MIRROR}/https://github.com/microsoft/mscclpp.git
     GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
     GIT_SHALLOW    OFF
 )
