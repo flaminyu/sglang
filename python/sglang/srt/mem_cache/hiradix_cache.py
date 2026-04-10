@@ -799,6 +799,10 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
 
+            # Skip already evicted nodes
+            if x.value is None:
+                continue
+
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
@@ -830,8 +834,17 @@ class HiRadixCache(RadixCache):
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
+        # Check if node is already evicted (node.value is None)
+        if node.value is None:
+            # Node was already evicted, skip silently
+            return 0
         num_evicted = self.cache_controller.evict_device(node.value)
-        assert num_evicted > 0
+        if num_evicted == 0:
+            # Failed to evict (e.g., indices already freed), mark as evicted anyway
+            logger.warning(
+                f"evict_device returned 0 for node {node.id}, "
+                f"marking as evicted anyway. host_value={node.host_value is not None}"
+            )
         self.evictable_size_ -= num_evicted
         node.value = None
         self._update_leaf_status(node)

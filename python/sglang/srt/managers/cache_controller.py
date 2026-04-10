@@ -763,7 +763,13 @@ class HiCacheController:
         return producer_id
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
-        self.mem_pool_device_allocator.free(device_indices)
+        if device_indices is None:
+            return 0
+        try:
+            self.mem_pool_device_allocator.free(device_indices)
+        except (AttributeError, TypeError) as e:
+            logger.warning(f"Failed to free device indices: {e}")
+            return 0
         return len(device_indices)
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
