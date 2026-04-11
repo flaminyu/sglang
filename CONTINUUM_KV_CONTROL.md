@@ -1,69 +1,95 @@
-# Continuum-Style Worker KV Control (Experimental)
+# Continuum KV TTL 控制（基于论文实现）
 
-该文档对应当前项目内的 `KVBlocking/sglang_continuum`。旧路径 `LLM/sglang_continuum` 只用于历史记录或启动辅助脚本，不再是项目主入口。
+该文档对应当前项目内的 `KVBlocking/sglang_continuum`。这是对 [Continuum 论文](https://arxiv.org/abs/2511.02230) 的实现。
 
 ## 1) 启动服务
 
 ```bash
-cd /home/comp/csgfyu/multi-agents/KVBlocking
+cd /data/home/sczd795/run/KVbloking
 
-# 当前推荐做法：直接用项目脚本或实验脚本启动。
-# 若继续使用历史辅助脚本，它仍位于：
-bash /home/comp/csgfyu/LLM/start_sglang_continuum_qwen32b.sh
+# 启动 sglang 服务
+python -m sglang.launch_server ...
 ```
 
 默认监听：`http://127.0.0.1:31080`
 
-## 2) Worker KV 策略接口
+## 2) 工作原理
 
-### 查看策略表
+### 核心思想
 
-```bash
-curl -s http://127.0.0.1:31080/continuum/worker-kv-policy | python -m json.tool
+Continuum 论文提出的核心问题是：**多轮 Agent 工作负载中的 KV Cache 管理**。
+
+传统推理引擎在请求完成后会立即驱逐 KV Cache，但对于 Agent 工作负载（LLM 调用与工具调用交错执行），这会导致：
+1. **Prefill/Reload 开销**：下次请求需要重新计算 KV
+2. **Per-turn 排队延迟**：即使启用了 CPU 卸载，后续请求也需要等待 GPU 内存
+
+### TTL 机制
+
+Continuum 引入了 **Time-To-Live (TTL)** 机制：
+
+```
+请求完成（带 tool call）
+    ↓
+计算最优 TTL：τ* = argmax_τ P(τ,f) × (T·η + Prefill-Reload) - (MemUsage/M) × τ
+    ↓
+在 TTL 窗口内保留 KV Cache
+    ↓
+如果工具调用在 TTL 内完成 → 复用 KV，节省 Prefill 开销
+如果工具调用超过 TTL      → 自动驱逐 KV，防止内存阻塞
 ```
 
-### 设置策略（pin 到 GPU）
+### 关键公式
 
-```bash
-curl -s -X PUT http://127.0.0.1:31080/continuum/worker-kv-policy \
-  -H 'content-type: application/json' \
-  -d '{"worker_id":"worker-1","action":"pin_gpu","priority":-20}'
+论文公式：
+```
+τ* = argmax_τ P(τ,f) × (T·η + Prefill-Reload) - (MemUsage/M) × τ
 ```
 
-### 设置策略（更容易 spill 到 CPU）
+其中：
+- **P(τ,f)** = 工具 f 在 τ 时间内完成的概率（基于历史 CDF）
+- **T** = 平均排队延迟
+- **η** = 记忆因子 = -Corr(k, N-k)
+- **Prefill-Reload** = 重载 KV 的时间开销
+- **MemUsage/M** = 相对内存占用
+
+## 3) 配置参数（环境变量）
 
 ```bash
-curl -s -X PUT http://127.0.0.1:31080/continuum/worker-kv-policy \
-  -H 'content-type: application/json' \
-  -d '{"worker_id":"worker-1","action":"spill_cpu","priority":20}'
+# TTL 默认值（秒）
+SGLANG_CONTINUUM_TTL_DEFAULT_SEC=15
+
+# TTL 最小值（秒）
+SGLANG_CONTINUUM_TTL_MIN_SEC=2
+
+# TTL 最大值（秒）
+SGLANG_CONTINUUM_TTL_MAX_SEC=90
+
+# 历史记录最大长度
+SGLANG_CONTINUUM_TTL_HISTORY_MAXLEN=4096
+
+# 触发计算的样本数阈值
+SGLANG_CONTINUUM_TTL_HISTORY_THRESHOLD=20
+
+# 工具延迟补偿（秒）
+SGLANG_CONTINUUM_TTL_TOOL_DELAY_SEC=0
+
+# 工具延迟放大系数
+SGLANG_CONTINUUM_TTL_TOOL_DELAY_RATIO=1.5
+
+# 内存压力惩罚系数
+SGLANG_CONTINUUM_MEMORY_PRESSURE_PENALTY=0.3
 ```
 
-### 设置策略（TTL 触发迁移）
+## 4) 客户端使用方式
 
-该策略在 worker 活跃时优先保留 GPU 可复用性；当该 worker 空闲超过 `ttl_sec` 后，会自动降级为 `spill_cpu`，从而允许其 KV 在后续内存压力下被迁移到较慢层。命名空间保持稳定，因此后续请求仍可触发 load-back，而不是直接丢失历史 KV。
+### 请求头标记
 
-```bash
-curl -s -X PUT http://127.0.0.1:31080/continuum/worker-kv-policy \
-  -H 'content-type: application/json' \
-  -d '{"worker_id":"worker-1","action":"ttl_spill","ttl_sec":20}'
-```
-
-### 触发一次驱逐（evict_once）
-
-```bash
-curl -s -X POST http://127.0.0.1:31080/continuum/worker-kv-evict \
-  -H 'content-type: application/json' \
-  -d '{"worker_id":"worker-1"}'
-```
-
-## 3) 客户端如何标记 slow worker
-
-给每个请求加 header：`x-continuum-worker-id`
+通过 `x-continuum-worker-id` header 标记请求的 program_id（用于识别同一个多轮 Agent）：
 
 ```bash
 curl -s http://127.0.0.1:31080/v1/chat/completions \
   -H 'content-type: application/json' \
-  -H 'x-continuum-worker-id: worker-1' \
+  -H 'x-continuum-worker-id: agent-session-123' \
   -d '{
     "model":"Qwen/Qwen3-32B-AWQ",
     "messages":[{"role":"user","content":"hello"}],
@@ -71,48 +97,64 @@ curl -s http://127.0.0.1:31080/v1/chat/completions \
   }'
 ```
 
-## 4) 当前实现范围（重要）
+### 请求上下文（可选）
 
-这是一个可用于 A/B 对比的实验控制面，当前做了：
+可以通过 header 提供额外上下文：
 
-- 按 `worker_id` 注入独立 KV 命名空间（`extra_key` 后缀 + epoch）。
-- 按策略注入调度优先级（`pin_gpu` 默认更高优先级，`spill_cpu` 默认更低）。
-- `evict_once` 通过递增 epoch，使旧命名空间的 KV 不再被该 worker 复用（软驱逐语义）。
-- `ttl_spill` 在 worker 活跃时使用 pin 语义，在空闲超过 TTL 后自动降级为 spill 语义，同时保持同一 worker 的 KV 命名空间不变。
-
-尚未实现：
-
-- 对单个 worker 的“硬驱逐”节点级删除（立即从 GPU/CPU 层精准移除该 worker 的全部历史节点）。
-- 对单个 worker 的“强制 GPU 常驻”硬保证（当前为优先级 + 命名空间策略）。
-
-这版适合先做 Continuum 风格实验与对照；后续可继续在 `hiradix_cache.py` 增加 node owner 标记和定向清理逻辑，实现硬驱逐/硬 pin。
+| Header | 说明 |
+|--------|------|
+| `x-continuum-worker-id` | Program/Worker 标识符 |
+| `x-continuum-program-id` | 显式的 program ID（优先级更高） |
+| `x-continuum-tool-name` | 当前 tool 名称（用于 per-tool TTL） |
+| `x-continuum-task-type` | 任务类型 |
+| `x-continuum-turn-index` | 当前轮次索引 |
+| `x-continuum-turn-count` | 总轮次数 |
 
 ## 5) 逐次 load_back 大小观测
 
-现在服务端会在每次真实 `load_back` 成功时写一条结构化日志，前缀为 `KV_LOAD_BACK_EVENT`。日志里包含：
-
-- `num_tokens`
-- `kv_cache_size_bytes`
-- `kv_cache_size_mb`
-- `kv_cache_size_gb`
-- `bytes_per_token`
-- `duration_sec`
-
-因此可以直接在 `sglang_serve.log` 中检索每次 load-back 的 KV 大小：
+服务端会在每次真实 `load_back` 成功时写一条结构化日志，前缀为 `KV_LOAD_BACK_EVENT`：
 
 ```bash
 grep 'KV_LOAD_BACK_EVENT' logs/.../sglang_serve.log
 ```
 
-对于 BFCL / KV isolation / KV-long 这类实验脚本，实验目录下还会自动导出：
+日志包含：
+- `num_tokens` - token 数量
+- `kv_cache_size_bytes/mb/gb` - KV Cache 大小
+- `bytes_per_token` - 每个 token 的字节数
+- `duration_sec` - load_back 耗时
+- `program_id` - 请求的 program ID
+- `ttl_sec` / `ttl_source` - TTL 计算结果和来源
 
-- `kv_load_back_event_details.csv`
+## 6) TTL 决策日志
 
-这个 CSV 是从服务端真实事件日志提取出来的逐次明细，适合做“每次 load-back 的 KV cache size”分析；而 `kv_migration_events.csv` 仍然保留 metrics counter 差分得到的近似事件视图，用于兼容旧分析脚本。
-
-如果你手头只有一个独立的 `sglang_serve.log`，也可以手工提取：
+每次 TTL 决策会记录 `CONTINUUM_TTL_DECISION` 日志：
 
 ```bash
-python scripts/extract_kv_load_back_events.py \
-  --serve-log logs/.../sglang_serve.log
+grep 'CONTINUUM_TTL_DECISION' logs/.../sglang_serve.log
 ```
+
+日志包含：
+- `program_id` - Program ID
+- `tool_name` - Tool 名称
+- `ttl_sec` - 计算出的 TTL 值
+- `ttl_source` - TTL 来源（default/tool_cdf:xxx/program_cdf/global_cdf）
+- `sample_count` - 历史样本数量
+- `queue_avg` / `queue_component` - 排队延迟估计
+- `eta` - 记忆因子
+- `reload_benefit` - 重载收益
+- `benefit` - 总收益
+- `estimated_memory_pressure` - 内存压力估计
+
+## 7) 与论文的差异
+
+当前实现相比论文原版的主要差异：
+
+| 特性 | 论文 | 当前实现 |
+|------|------|----------|
+| 标识符 | `program_id` | `worker_id` header（映射到 program_id） |
+| TTL 作用域 | 单个请求的 KV | 基于 program 追踪 |
+| Pin 机制 | 请求级别 pin | 通过 extra_key 后缀追踪 |
+| 调度优先级 | TTL-aware priority | 保持默认调度 |
+
+**注意**：论文中使用 `program_id` 来标识同一个多轮 Agent 的多个请求。当前实现通过 `x-continuum-worker-id` header 传递，作为 program_id 的来源。

@@ -762,15 +762,22 @@ class HiCacheController:
         )
         return producer_id
 
-    def evict_device(self, device_indices: torch.Tensor) -> int:
+    def evict_device(self, device_indices) -> int:
+        # 防御性检查：处理 None 和空值
         if device_indices is None:
+            return 0
+        # 检查是否是有效的张量
+        if not hasattr(device_indices, 'numel'):
+            logger.warning(f"evict_device received non-tensor: {type(device_indices)}")
+            return 0
+        if device_indices.numel() == 0:
             return 0
         try:
             self.mem_pool_device_allocator.free(device_indices)
         except (AttributeError, TypeError) as e:
             logger.warning(f"Failed to free device indices: {e}")
             return 0
-        return len(device_indices)
+        return device_indices.numel()
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:

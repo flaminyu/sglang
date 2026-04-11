@@ -591,66 +591,6 @@ class RadixCache(BasePrefixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
-    def continuum_evict_worker_namespace(self, worker_id: str) -> dict[str, int | str]:
-        if self.disable:
-            return {
-                "num_nodes_removed": 0,
-                "num_device_tokens_evicted": 0,
-                "num_host_tokens_evicted": 0,
-                "message": "cache disabled",
-            }
-
-        marker = f"__continuum_worker={worker_id}__"
-        num_nodes_removed = 0
-        num_device_tokens_evicted = 0
-
-        def _all_leaves() -> list[TreeNode]:
-            leaves: list[TreeNode] = []
-            stack = [self.root_node]
-            while stack:
-                cur = stack.pop()
-                if cur is self.root_node:
-                    stack.extend(cur.children.values())
-                    continue
-                if len(cur.children) == 0:
-                    leaves.append(cur)
-                else:
-                    stack.extend(cur.children.values())
-            return leaves
-
-        def _belongs_to_worker(node: TreeNode) -> bool:
-            cur = node
-            while cur is not None and cur is not self.root_node:
-                extra_key = cur.key.extra_key if cur.key is not None else None
-                if extra_key and marker in extra_key:
-                    return True
-                cur = cur.parent
-            return False
-
-        changed = True
-        while changed:
-            changed = False
-            leaves = _all_leaves()
-            for node in leaves:
-                if node is self.root_node:
-                    continue
-                if not _belongs_to_worker(node):
-                    continue
-                if not node.evicted and node.value is not None:
-                    self.token_to_kv_pool_allocator.free(node.value)
-                    num_device_tokens_evicted += len(node.value)
-                    self._record_remove_event(node)
-                self._delete_leaf(node)
-                num_nodes_removed += 1
-                changed = True
-
-        return {
-            "num_nodes_removed": num_nodes_removed,
-            "num_device_tokens_evicted": num_device_tokens_evicted,
-            "num_host_tokens_evicted": 0,
-            "message": "ok",
-        }
-
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0

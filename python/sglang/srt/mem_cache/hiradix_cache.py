@@ -900,116 +900,6 @@ class HiRadixCache(RadixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
-    def continuum_evict_worker_namespace(self, worker_id: str) -> dict[str, int | str]:
-        marker = f"__continuum_worker={worker_id}__"
-        num_nodes_removed = 0
-        num_device_tokens_evicted = 0
-        num_host_tokens_evicted = 0
-
-        def _all_leaves() -> list[TreeNode]:
-            leaves: list[TreeNode] = []
-            stack = [self.root_node]
-            while stack:
-                cur = stack.pop()
-                if cur is self.root_node:
-                    stack.extend(cur.children.values())
-                    continue
-                if len(cur.children) == 0:
-                    leaves.append(cur)
-                else:
-                    stack.extend(cur.children.values())
-            return leaves
-
-        def _belongs_to_worker(node: TreeNode) -> bool:
-            cur = node
-            while cur is not None and cur is not self.root_node:
-                extra_key = cur.key.extra_key if cur.key is not None else None
-                if extra_key and marker in extra_key:
-                    return True
-                cur = cur.parent
-            return False
-
-        changed = True
-        while changed:
-            changed = False
-
-            device_leaves = _all_leaves()
-            for node in device_leaves:
-                if node is self.root_node:
-                    continue
-                if not _belongs_to_worker(node):
-                    continue
-
-                if not node.evicted and node.value is not None:
-                    if node.backuped:
-                        num_device_tokens_evicted += self.cache_controller.evict_device(
-                            node.value
-                        )
-                    else:
-                        self.cache_controller.mem_pool_device_allocator.free(node.value)
-                        num_device_tokens_evicted += len(node.value)
-                    node.value = None
-                    self._record_remove_event(node)
-
-                if node.backuped and node.host_ref_counter == 0:
-                    num_host_tokens_evicted += self.cache_controller.evict_host(
-                        node.host_value
-                    )
-
-                key = self.get_child_key_fn(node.key)
-                v = node.parent.children.pop(key, None)
-                if v != node:
-                    if v is not None:
-                        node.parent.children[key] = v
-                    continue
-
-                if node in self.evictable_leaves:
-                    self.evictable_leaves.remove(node)
-                if node in self.evictable_host_leaves:
-                    self.evictable_host_leaves.remove(node)
-
-                self._update_leaf_status(node.parent)
-                self._update_host_leaf_status(node.parent)
-                num_nodes_removed += 1
-                changed = True
-
-            host_leaves = _all_leaves()
-            for node in host_leaves:
-                if node is self.root_node:
-                    continue
-                if not _belongs_to_worker(node):
-                    continue
-                if not node.evicted:
-                    continue
-
-                num_host_tokens_evicted += self.cache_controller.evict_host(
-                    node.host_value
-                )
-
-                key = self.get_child_key_fn(node.key)
-                v = node.parent.children.pop(key, None)
-                if v != node:
-                    if v is not None:
-                        node.parent.children[key] = v
-                    continue
-
-                if node in self.evictable_host_leaves:
-                    self.evictable_host_leaves.remove(node)
-                if node in self.evictable_leaves:
-                    self.evictable_leaves.remove(node)
-
-                self._update_host_leaf_status(node.parent)
-                self._update_leaf_status(node.parent)
-                num_nodes_removed += 1
-                changed = True
-
-        return {
-            "num_nodes_removed": num_nodes_removed,
-            "num_device_tokens_evicted": num_device_tokens_evicted,
-            "num_host_tokens_evicted": num_host_tokens_evicted,
-            "message": "ok",
-        }
-
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
@@ -1076,26 +966,6 @@ class HiRadixCache(RadixCache):
         if not trace_ctx:
             trace_ctx = get_namespace_trace(extra_key)
 
-        # Fallback: parse worker_id from extra_key when trace is empty (cross-process)
-        if not trace_ctx.get("worker_id") and extra_key:
-            _ek = str(extra_key)
-            _wstart = _ek.find("__continuum_worker=")
-            if _wstart >= 0:
-                _wval = _ek[_wstart + len("__continuum_worker="):]
-                _wend = _wval.find("__")
-                trace_ctx["worker_id"] = _wval[:_wend] if _wend >= 0 else _wval
-                _pstart = _ek.find("__policy=")
-                if _pstart >= 0:
-                    _pval = _ek[_pstart + len("__policy="):]
-                    _pend = _pval.find("__")
-                    trace_ctx["ttl_source"] = _pval[:_pend] if _pend >= 0 else _pval
-                else:
-                    _mstart = _ek.find("__mode=")
-                    if _mstart >= 0:
-                        _mval = _ek[_mstart + len("__mode="):]
-                        _mend = _mval.find("__")
-                        trace_ctx["ttl_source"] = _mval[:_mend] if _mend >= 0 else _mval
-
         logger.info(
             "KV_LOAD_BACK_EVENT %s",
             json.dumps(
@@ -1110,7 +980,6 @@ class HiRadixCache(RadixCache):
                     "duration_sec": round(load_back_duration, 6),
                     "size_source": "host_pool_size_per_token",
                     "extra_key": extra_key,
-                    "worker_id": trace_ctx.get("worker_id"),
                     "program_id": trace_ctx.get("program_id"),
                     "tool_name": trace_ctx.get("tool_name"),
                     "task_type": trace_ctx.get("task_type"),

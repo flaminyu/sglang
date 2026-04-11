@@ -336,6 +336,7 @@ class ServerArgs:
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
+    continuum_ttl_sec: Optional[float] = None  # Continuum TTL policy
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
@@ -3265,6 +3266,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.priority_scheduling_preemption_threshold,
             help="Minimum difference in priorities for an incoming request to have to preempt running request(s).",
+        )
+        parser.add_argument(
+            "--continuum-ttl-sec",
+            type=float,
+            default=None,
+            help="Enable Continuum TTL policy with specified default TTL in seconds. "
+            "When set, KV cache will be automatically evicted after TTL expires.",
         )
         parser.add_argument(
             "--schedule-conservativeness",

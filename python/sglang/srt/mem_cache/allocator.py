@@ -153,6 +153,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return select_index
 
     def free(self, free_index: torch.Tensor):
+        # 防御性检查：处理 None 值（可能在 worker_id 删除后出现）
+        if free_index is None:
+            return
         if free_index.numel() == 0:
             return
 

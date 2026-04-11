@@ -227,11 +227,3 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
-
-    def continuum_evict_worker_namespace(self, worker_id: str) -> dict[str, int | str]:
-        return {
-            "num_nodes_removed": 0,
-            "num_device_tokens_evicted": 0,
-            "num_host_tokens_evicted": 0,
-            "message": "not supported by this cache implementation",
-        }

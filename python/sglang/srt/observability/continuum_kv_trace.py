@@ -32,7 +32,6 @@ def _update_trace(extra_key: Optional[str], payload: Dict[str, Any]) -> Dict[str
 def register_namespace_request(
     extra_key: Optional[str],
     *,
-    worker_id: Optional[str] = None,
     program_id: Optional[str] = None,
     tool_name: Optional[str] = None,
     task_type: Optional[str] = None,
@@ -45,7 +44,6 @@ def register_namespace_request(
     return _update_trace(
         extra_key,
         {
-            "worker_id": worker_id,
             "program_id": program_id,
             "tool_name": tool_name,
             "task_type": task_type,

@@ -340,10 +340,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.event_loop = None
         self.asyncio_tasks = set()
 
-        # Continuum-style worker KV control (experimental)
-        # worker_id -> policy state for worker-scoped KV control.
-        self._continuum_worker_kv_state: Dict[str, Dict[str, Any]] = {}
-        self._continuum_worker_kv_lock = threading.Lock()
+        # Continuum-style KV TTL control for multi-turn agent workloads
+        # Tracks program-level statistics for TTL computation
         self._continuum_history_lock = threading.Lock()
         self._continuum_request_context_by_rid: Dict[str, Dict[str, Any]] = {}
         self._continuum_program_stats: Dict[str, Dict[str, Any]] = {}
@@ -468,13 +466,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self._continuum_global_e2e_history: deque[float] = deque(
             maxlen=ttl_history_maxlen
         )
-        self._continuum_ttl_stop = threading.Event()
-        self._continuum_ttl_thread = threading.Thread(
-            target=self._continuum_ttl_loop,
-            name="continuum-worker-kv-ttl",
-            daemon=True,
-        )
-        self._continuum_ttl_thread.start()
 
         # Health check
         self.server_status = ServerStatus.Starting
@@ -487,22 +478,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
-
-    def _continuum_default_worker_kv_state(self) -> Dict[str, Any]:
-        return {
-            "mode": "spill_cpu",
-            "epoch": 0,
-            "priority": None,
-            "policy": "spill_cpu",
-            "ttl_sec": None,
-            "computed_ttl_sec": None,
-            "ttl_source": "fixed",
-            "last_touch_ts": None,
-            "active_mode": "pin_gpu",
-            "idle_mode": "spill_cpu",
-            "last_program_id": None,
-            "last_tool_name": None,
-        }
 
     def _continuum_get_program_stats(self, program_id: str) -> Dict[str, Any]:
         return self._continuum_program_stats.setdefault(
@@ -549,11 +524,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     def _continuum_normalize_request_context(
         self,
         request_context: Optional[Dict[str, Any]],
-        worker_id: str,
+        program_id: str,
         req: Union[GenerateReqInput, EmbeddingReqInput],
     ) -> Dict[str, Any]:
+        """Normalize request context extracting program_id and other metadata."""
         raw_ctx = dict(request_context or {})
-        program_id = str(raw_ctx.get("program_id") or getattr(req, "conversation_id", "") or worker_id).strip()
         tool_name = str(raw_ctx.get("tool_name") or "").strip() or None
         task_type = str(raw_ctx.get("task_type") or "").strip() or None
         turn_index = raw_ctx.get("turn_index")
@@ -567,8 +542,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         except Exception:
             turn_count = None
         return {
-            "worker_id": worker_id,
-            "program_id": program_id or worker_id,
+            "program_id": program_id,
             "tool_name": tool_name,
             "task_type": task_type,
             "turn_index": turn_index,
@@ -596,7 +570,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     def _continuum_select_dynamic_ttl(
         self,
-        worker_id: str,
+        program_id: str,
         req: Union[GenerateReqInput, EmbeddingReqInput],
         prospective_extra_key: str,
         ctx: Optional[Dict[str, Any]] = None,
@@ -614,14 +588,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         - MemUsage/M = relative memory usage
         """
         default_ttl = self._continuum_ttl_default_sec
-        with self._continuum_worker_kv_lock:
-            state = self._continuum_worker_kv_state.get(worker_id)
-            if state is not None and state.get("ttl_sec") is not None:
-                default_ttl = max(float(state.get("ttl_sec") or default_ttl), 0.5)
 
         if not ctx:
             ctx = self._continuum_get_request_context(req)
-        program_id = str(ctx.get("program_id") or worker_id)
         tool_name = ctx.get("tool_name")  # Per-tool tracking
         namespace_trace = get_namespace_trace(prospective_extra_key)
         now = real_time()
@@ -832,102 +801,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             },
         )
 
-    def _continuum_ttl_loop(self) -> None:
-        while not getattr(self, "gracefully_exit", False):
-            now = real_time()
-            with self._continuum_worker_kv_lock:
-                for state in self._continuum_worker_kv_state.values():
-                    if str(state.get("policy", "")) != "ttl_spill":
-                        continue
-                    ttl_sec = float(
-                        state.get("computed_ttl_sec")
-                        or state.get("ttl_sec")
-                        or 0.0
-                    )
-                    last_touch = float(state.get("last_touch_ts") or 0.0)
-                    idle_mode = str(state.get("idle_mode", "spill_cpu"))
-                    if ttl_sec <= 0.0 or last_touch <= 0.0:
-                        continue
-                    if now - last_touch >= ttl_sec and str(state.get("mode", "")) != idle_mode:
-                        state["mode"] = idle_mode
-            if self._continuum_ttl_stop.wait(0.5):
-                break
-
-    def continuum_get_worker_kv_state(self) -> Dict[str, Dict[str, Any]]:
-        with self._continuum_worker_kv_lock:
-            return copy.deepcopy(self._continuum_worker_kv_state)
-
-    def continuum_set_worker_kv_policy(
-        self,
-        worker_id: str,
-        action: str,
-        priority: Optional[int] = None,
-        ttl_sec: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        worker_id = (worker_id or "").strip()
-        if not worker_id:
-            raise ValueError("worker_id must not be empty")
-
-        action = (action or "").strip().lower()
-        if action not in {"pin_gpu", "spill_cpu", "evict_once", "ttl_spill"}:
-            raise ValueError("action must be one of: pin_gpu, spill_cpu, evict_once, ttl_spill")
-
-        with self._continuum_worker_kv_lock:
-            state = self._continuum_worker_kv_state.setdefault(
-                worker_id,
-                self._continuum_default_worker_kv_state(),
-            )
-
-            if action == "evict_once":
-                state["epoch"] = int(state.get("epoch", 0)) + 1
-                state["mode"] = "spill_cpu"
-                state["policy"] = "spill_cpu"
-                state["ttl_sec"] = None
-                state["last_touch_ts"] = None
-            elif action == "pin_gpu":
-                state["mode"] = "pin_gpu"
-                state["policy"] = "pin_gpu"
-                state["ttl_sec"] = None
-                state["last_touch_ts"] = real_time()
-            elif action == "spill_cpu":
-                state["mode"] = "spill_cpu"
-                state["policy"] = "spill_cpu"
-                state["ttl_sec"] = None
-                state["last_touch_ts"] = real_time()
-            elif action == "ttl_spill":
-                ttl_value = float(ttl_sec or 0.0)
-                state["policy"] = "ttl_spill"
-                state["ttl_sec"] = ttl_value if ttl_value > 0.0 else self._continuum_ttl_default_sec
-                state["computed_ttl_sec"] = state["ttl_sec"]
-                state["ttl_source"] = "default"
-                state["active_mode"] = "pin_gpu"
-                state["idle_mode"] = "spill_cpu"
-                state["mode"] = str(state.get("active_mode", "pin_gpu"))
-                state["last_touch_ts"] = real_time()
-
-            if priority is not None:
-                state["priority"] = int(priority)
-
-            return {
-                "worker_id": worker_id,
-                "action": action,
-                "policy": state.get("policy"),
-                "mode": state["mode"],
-                "epoch": int(state["epoch"]),
-                "priority": state.get("priority"),
-                "ttl_sec": state.get("ttl_sec"),
-                "computed_ttl_sec": state.get("computed_ttl_sec"),
-                "ttl_source": state.get("ttl_source"),
-                "last_touch_ts": state.get("last_touch_ts"),
-            }
-
     def continuum_attach_request_context(
         self,
         req: Union[GenerateReqInput, EmbeddingReqInput],
         worker_id: str,
         request_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        ctx = self._continuum_normalize_request_context(request_context, worker_id, req)
+        """Attach request context extracting program_id from request metadata."""
+        # Extract program_id from conversation_id or use worker_id as fallback
+        program_id = str(getattr(req, "conversation_id", "") or worker_id).strip()
+        if not program_id:
+            program_id = worker_id.strip()
+        
+        ctx = self._continuum_normalize_request_context(request_context, program_id, req)
         rid = getattr(req, "rid", None)
         if isinstance(rid, str) and rid:
             with self._continuum_history_lock:
@@ -942,118 +828,68 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         worker_id: Optional[str],
         request_context: Optional[Dict[str, Any]] = None,
     ) -> None:
-        worker_id = (worker_id or "").strip()
-        if not worker_id:
-            return
+        """Apply Continuum TTL policy to request based on program_id.
+        
+        This follows the Continuum paper's approach: for requests with tool calls,
+        calculate optimal TTL based on historical tool execution times and apply it
+        to the KV cache for reuse in subsequent turns.
+        
+        Args:
+            req: The request object (GenerateReqInput or EmbeddingReqInput)
+            worker_id: Optional worker identifier; if None, uses conversation_id
+            request_context: Optional context dictionary with metadata
+        """
+        # Extract worker_id from request if not provided
+        if worker_id is None or worker_id.strip() == "":
+            # Try to get worker_id from request metadata
+            worker_id = getattr(req, "extra_key", None)
+            if worker_id is None:
+                worker_id = str(getattr(req, "rid", "unknown"))[:32]
+            worker_id = str(worker_id).strip() or "unknown"
 
         ctx = self.continuum_attach_request_context(req, worker_id, request_context)
+        program_id = ctx.get("program_id", worker_id)
 
-        with self._continuum_worker_kv_lock:
-            state = self._continuum_worker_kv_state.get(worker_id)
-
-            if state is None:
-                state = self._continuum_default_worker_kv_state()
-            elif str(state.get("policy", "")) == "ttl_spill":
-                state["mode"] = str(state.get("active_mode", "pin_gpu"))
-
-            state = copy.deepcopy(state)
-
-        mode = str(state.get("mode", "spill_cpu"))
-        epoch = int(state.get("epoch", 0))
-        explicit_priority = state.get("priority")
-        policy = str(state.get("policy", mode))
-
-        default_priority = -20 if mode == "pin_gpu" else 20
-        final_priority = (
-            int(explicit_priority) if explicit_priority is not None else default_priority
+        # Calculate TTL based on Continuum paper's utility model
+        computed_ttl_sec, ttl_source, ttl_debug = self._continuum_select_dynamic_ttl(
+            program_id,
+            req,
+            None,  # No prospective extra_key needed
+            ctx=ctx,
         )
 
-        if policy == "ttl_spill":
-            suffix = f"__continuum_worker={worker_id}__policy=ttl_spill__epoch={epoch}"
-        else:
-            suffix = f"__continuum_worker={worker_id}__mode={mode}__epoch={epoch}"
+        # Build suffix for extra_key: includes program_id and computed TTL
+        suffix = f"__continuum_prog={program_id}__ttl={round(computed_ttl_sec, 3)}"
         base_extra_key = req.extra_key if isinstance(req.extra_key, str) else ""
         req.extra_key = base_extra_key + suffix
 
-        if policy == "ttl_spill":
-            computed_ttl_sec, ttl_source, ttl_debug = self._continuum_select_dynamic_ttl(
-                worker_id,
-                req,
-                req.extra_key,
-                ctx=ctx,
-            )
-            state["computed_ttl_sec"] = computed_ttl_sec
-            state["ttl_source"] = ttl_source
-            state["last_touch_ts"] = real_time()
-            state["mode"] = str(state.get("active_mode", "pin_gpu"))
-            state["last_program_id"] = ctx.get("program_id")
-            state["last_tool_name"] = ctx.get("tool_name")
-            with self._continuum_worker_kv_lock:
-                live_state = self._continuum_worker_kv_state.setdefault(
-                    worker_id,
-                    self._continuum_default_worker_kv_state(),
-                )
-                live_state.update(
-                    {
-                        "computed_ttl_sec": computed_ttl_sec,
-                        "ttl_source": ttl_source,
-                        "last_touch_ts": state["last_touch_ts"],
-                        "mode": state["mode"],
-                        "last_program_id": ctx.get("program_id"),
-                        "last_tool_name": ctx.get("tool_name"),
-                    }
-                )
-            logger.info(
-                "CONTINUUM_TTL_DECISION %s",
-                json.dumps(
-                    {
-                        "worker_id": worker_id,
-                        "program_id": ctx.get("program_id"),
-                        "tool_name": ctx.get("tool_name"),
-                        "ttl_sec": round(computed_ttl_sec, 6),
-                        "ttl_source": ttl_source,
-                        **ttl_debug,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-            )
-        else:
-            state["last_touch_ts"] = real_time()
+        logger.info(
+            "CONTINUUM_TTL_DECISION %s",
+            json.dumps(
+                {
+                    "worker_id": worker_id,
+                    "program_id": program_id,
+                    "tool_name": ctx.get("tool_name"),
+                    "ttl_sec": round(computed_ttl_sec, 6),
+                    "ttl_source": ttl_source,
+                    **ttl_debug,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
 
-        if req.priority is None:
-            req.priority = final_priority
-
-        allowed = set(self.server_args.tokenizer_metrics_allowed_custom_labels or [])
-        continuum_labels = {
-            "continuum_worker_id": worker_id,
-            "continuum_kv_mode": mode,
-            "continuum_kv_epoch": str(epoch),
-        }
-        if ctx.get("program_id"):
-            continuum_labels["continuum_program_id"] = str(ctx["program_id"])
-        if ctx.get("tool_name"):
-            continuum_labels["continuum_tool_name"] = str(ctx["tool_name"])
-        if allowed:
-            continuum_labels = {
-                key: value for key, value in continuum_labels.items() if key in allowed
-            }
-            if continuum_labels:
-                if req.custom_labels is None:
-                    req.custom_labels = {}
-                req.custom_labels.update(continuum_labels)
-
+        # Record request context for TTL tracking
         register_namespace_request(
             req.extra_key,
-            worker_id=worker_id,
-            program_id=ctx.get("program_id"),
+            program_id=program_id,
             tool_name=ctx.get("tool_name"),
             task_type=ctx.get("task_type"),
             prompt_text=self._continuum_prompt_excerpt(req),
             turn_index=ctx.get("turn_index"),
             turn_count=ctx.get("turn_count"),
-            ttl_sec=state.get("computed_ttl_sec") if policy == "ttl_spill" else None,
-            ttl_source=state.get("ttl_source") if policy == "ttl_spill" else policy,
+            ttl_sec=computed_ttl_sec,
+            ttl_source=ttl_source,
         )
 
     def init_request_logging_and_dumping(self):
@@ -1196,6 +1032,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+
+        # 应用 Continuum TTL 策略（如果启用）
+        # 这会在请求的 extra_key 中添加 TTL 信息，用于 KV 缓存管理
+        if self.server_args.continuum_ttl_sec is not None and self.server_args.continuum_ttl_sec > 0:
+            self.continuum_apply_policy_to_request(obj, worker_id=None)
 
         self._req_stats_init(obj, request)
         if self.server_args.language_only:
