@@ -150,14 +150,46 @@ class SchedulerRuntimeCheckerMixin:
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
-        memory_leak = (available_size + evictable_size) != (
-            # self.max_total_num_tokens
-            # if not self.enable_hierarchical_cache
-            # else self.max_total_num_tokens - protected_size
-            self.max_total_num_tokens
-            - protected_size
+        
+        # 计算预期值：available + evictable 应该等于 max - protected
+        expected_available_plus_evictable = self.max_total_num_tokens - protected_size
+        actual_available_plus_evictable = available_size + evictable_size
+        
+        memory_leak = actual_available_plus_evictable != expected_available_plus_evictable
+        
+        # 构建详细诊断信息
+        token_msg = (
+            f"max_total_num_tokens={self.max_total_num_tokens}, "
+            f"available_size={available_size}, "
+            f"evictable_size={evictable_size}, "
+            f"protected_size={protected_size}, "
+            f"expected_sum={expected_available_plus_evictable}, "
+            f"actual_sum={actual_available_plus_evictable}, "
+            f"leaked={expected_available_plus_evictable - actual_available_plus_evictable}\n"
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+        
+        # 如果检测到泄漏，添加更详细的调试信息
+        if memory_leak:
+            # 检查 allocator 内部状态
+            alloc_free = len(self.token_to_kv_pool_allocator.free_pages)
+            alloc_release = len(self.token_to_kv_pool_allocator.release_pages)
+            token_msg += (
+                f"[DEBUG] allocator: free_pages={alloc_free}, "
+                f"release_pages={alloc_release}, "
+                f"total_allocator_free={alloc_free + alloc_release}\n"
+            )
+            
+            # 检查 tree_cache 内部状态
+            try:
+                tree_free = self.tree_cache.evictable_size()
+                tree_protected = self.tree_cache.protected_size()
+                token_msg += (
+                    f"[DEBUG] tree_cache: evictable={tree_free}, "
+                    f"protected={tree_protected}\n"
+                )
+            except Exception as e:
+                token_msg += f"[DEBUG] tree_cache check failed: {e}\n"
+        
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:

@@ -2,6 +2,10 @@
 
 该文档对应当前项目内的 `KVBlocking/sglang_continuum`。这是对 [Continuum 论文](https://arxiv.org/abs/2511.02230) 的实现。
 
+**重要说明**：`continuum_apply_policy_to_request()` 函数已在以下位置被调用：
+- `tokenizer_manager.py` 第 1039 行（通过 `server_args.continuum_ttl_sec` 触发）
+- `serving_base.py` 第 321 行（通过 `continuum_ttl_sec` 参数触发）
+
 ## 1) 启动服务
 
 ```bash
@@ -148,13 +152,17 @@ grep 'CONTINUUM_TTL_DECISION' logs/.../sglang_serve.log
 
 ## 7) 与论文的差异
 
-当前实现相比论文原版的主要差异：
+当前实现已与论文保持一致，以下是设计对照：
 
 | 特性 | 论文 | 当前实现 |
 |------|------|----------|
-| 标识符 | `program_id` | `worker_id` header（映射到 program_id） |
-| TTL 作用域 | 单个请求的 KV | 基于 program 追踪 |
+| 标识符 | `program_id` | `program_id`（通过 `x-continuum-worker-id` header 传递） |
+| TTL 作用域 | 单个请求的 KV | 基于 program 追踪的 TTL 机制 |
 | Pin 机制 | 请求级别 pin | 通过 extra_key 后缀追踪 |
+| TTL 决策 | 请求完成时计算 | `continuum_apply_policy_to_request()` 在请求入口调用 |
 | 调度优先级 | TTL-aware priority | 保持默认调度 |
 
-**注意**：论文中使用 `program_id` 来标识同一个多轮 Agent 的多个请求。当前实现通过 `x-continuum-worker-id` header 传递，作为 program_id 的来源。
+**实现说明**：
+- 论文中使用 `program_id` 来标识同一个多轮 Agent 的多个请求
+- 当前实现通过 `x-continuum-worker-id` header 传递，作为 program_id 的来源
+- TTL 函数 `continuum_apply_policy_to_request()` 在 `generate_request()` 和 `_do_generate()` 中被调用

@@ -753,6 +753,13 @@ class HiRadixCache(RadixCache):
 
         delta = 0
         while node != self.root_node:
+            # 防御性检查：lock_ref 不应该小于 0
+            if node.lock_ref <= 0:
+                logger.warning(
+                    f"dec_lock_ref: node.lock_ref <= 0 detected! "
+                    f"node_id={node.id}, lock_ref={node.lock_ref}, "
+                    f"key_len={len(node.key) if node.key else 0}"
+                )
             if node.lock_ref == 1:
                 self.evictable_size_ += len(node.key)
                 self.protected_size_ -= len(node.key)
@@ -766,6 +773,30 @@ class HiRadixCache(RadixCache):
                 ), f"This request holds the node from another tree"
             node = node.parent
         return delta
+
+    def _check_lock_ref_balance(self):
+        """检查所有节点的 lock_ref 是否正确平衡"""
+        issues = []
+        
+        def check_node(node, expected_lock=0):
+            if node.lock_ref != expected_lock:
+                issues.append(
+                    f"lock_ref mismatch: node_id={node.id}, "
+                    f"expected={expected_lock}, actual={node.lock_ref}"
+                )
+            # 子节点的 lock_ref 应该 >= 父节点的 lock_ref
+            for child in node.children.values():
+                check_node(child, node.lock_ref)
+        
+        check_node(self.root_node, 0)
+        
+        if issues:
+            logger.warning(
+                f"lock_ref imbalance detected! {len(issues)} issues:\n" + 
+                "\n".join(issues[:10])  # 只打印前 10 个问题
+            )
+            return False
+        return True
 
     def _update_host_leaf_status(self, node: TreeNode):
         if not node.evicted or node.lock_ref > 0:
@@ -786,15 +817,57 @@ class HiRadixCache(RadixCache):
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
-        eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
-        ]
-        heapq.heapify(eviction_heap)
-
+        
+        # DTTL: 两阶段驱逐策略
+        # 第一阶段：优先驱逐 TTL 已过期的节点
+        expired_nodes = []
+        normal_heap = []
+        
+        for node in leaves:
+            # 检查 TTL 是否过期（lock_ref 必须为 0）
+            if node.is_expired and node.lock_ref == 0 and node.value is not None:
+                expired_nodes.append(node)
+            else:
+                # 正常的 LRU/LFU 驱逐
+                priority = self.eviction_strategy.get_priority(node)
+                heapq.heappush(normal_heap, (priority, node))
+        
+        # 执行两阶段驱逐
         num_evicted = 0
         write_back_nodes = []
-        while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
+        
+        # 第一阶段：驱逐已过期的节点
+        for x in expired_nodes:
+            if num_evicted >= num_tokens:
+                break
+            if x.value is None:
+                continue
+                
+            if not x.backuped:
+                if self.cache_controller.write_policy == "write_back":
+                    num_evicted += self.write_backup(x, write_back=True)
+                    write_back_nodes.append(x)
+                else:
+                    num_evicted += self._evict_regular(x)
+            else:
+                num_evicted += self._evict_backuped(x)
+                
+            # 更新父节点状态
+            for child in x.parent.children.values():
+                if child in write_back_nodes:
+                    continue
+                if not child.evicted:
+                    break
+            else:
+                # 所有子节点都已驱逐或没有子节点
+                if x.parent in expired_nodes:
+                    continue
+                if x.parent.lock_ref == 0 and x.parent.value is not None:
+                    expired_nodes.append(x.parent)
+        
+        # 第二阶段：如果还没驱逐够，按 LRU/LFU 驱逐
+        while num_evicted < num_tokens and len(normal_heap):
+            _priority, x = heapq.heappop(normal_heap)
 
             if x.lock_ref > 0:
                 continue
@@ -821,7 +894,7 @@ class HiRadixCache(RadixCache):
             else:
                 # all children are evicted or no children
                 new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+                heapq.heappush(normal_heap, (new_priority, x.parent))
 
         if self.cache_controller.write_policy == "write_back":
             self.writing_check(write_back=True)
@@ -831,6 +904,14 @@ class HiRadixCache(RadixCache):
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
+
+    def _evict_regular(self, node: TreeNode):
+        # evict a node not initiated write to host
+        node_size = len(node.value) if node.value is not None else 0
+        self.cache_controller.mem_pool_device_allocator.free(node.value)
+        num_evicted = len(node.value)
+        self._delete_leaf(node)
+        return num_evicted
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
@@ -851,13 +932,6 @@ class HiRadixCache(RadixCache):
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
-        return num_evicted
-
-    def _evict_regular(self, node: TreeNode):
-        # evict a node not initiated write to host
-        self.cache_controller.mem_pool_device_allocator.free(node.value)
-        num_evicted = len(node.value)
-        self._delete_leaf(node)
         return num_evicted
 
     def evict_host(self, num_tokens: int):
@@ -1373,6 +1447,7 @@ class HiRadixCache(RadixCache):
         value = params.value
         chunked = params.chunked
         priority = params.priority
+        ttl_sec = params.ttl_sec
 
         if priority is None:
             priority = 0
@@ -1405,6 +1480,9 @@ class HiRadixCache(RadixCache):
                     self._update_host_leaf_status(node)
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(node.parent)
+                    # DTTL: Set TTL for reactivated node
+                    if ttl_sec is not None:
+                        node.set_ttl(ttl_sec)
                 else:
                     self._inc_hit_count(node, chunked)
                     total_prefix_length += prefix_len
@@ -1420,6 +1498,9 @@ class HiRadixCache(RadixCache):
                     self._update_host_leaf_status(new_node)
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(new_node.parent)
+                    # DTTL: Set TTL for reactivated node
+                    if ttl_sec is not None:
+                        new_node.set_ttl(ttl_sec)
                 else:
                     self._inc_hit_count(new_node, chunked)
                     total_prefix_length += prefix_len
@@ -1440,6 +1521,10 @@ class HiRadixCache(RadixCache):
             self.evictable_size_ += len(value)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
+
+            # DTTL: Set TTL for new node
+            if ttl_sec is not None:
+                new_node.set_ttl(ttl_sec)
 
             # Compute hash_value if storage is enabled
             if self.enable_storage:

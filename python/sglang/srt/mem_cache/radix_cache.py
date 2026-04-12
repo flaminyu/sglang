@@ -77,6 +77,27 @@ class RadixKey:
         self.extra_key = extra_key
         # is bigram key
         self.is_bigram = is_bigram
+        # DTTL: extract TTL from extra_key if present
+        self._ttl_sec: Optional[float] = self._extract_ttl_from_extra_key(extra_key)
+
+    @staticmethod
+    def _extract_ttl_from_extra_key(extra_key: Optional[str]) -> Optional[float]:
+        """Extract TTL value from extra_key if it contains Continuum TTL suffix.
+
+        Expected format: "...__continuum_prog=xxx__ttl=3.0"
+        Returns the TTL value in seconds, or None if not present.
+        """
+        if extra_key is None:
+            return None
+        import re
+        match = re.search(r'__ttl=(\d+\.?\d*)', str(extra_key))
+        if match:
+            return float(match.group(1))
+        return None
+
+    def get_ttl_sec(self) -> Optional[float]:
+        """Get TTL in seconds from this key's extra_key."""
+        return self._ttl_sec
 
     def __len__(self) -> int:
         return len(self.token_ids)
@@ -117,6 +138,14 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        
+        # DTTL (Dynamic TTL) related fields
+        # TTL expiration time (absolute timestamp)
+        self.ttl_expiry_time: Optional[float] = None
+        # Last time TTL was checked
+        self.last_ttl_check: float = 0.0
+        # Whether this node is TTL-expired (cached for performance)
+        self._is_expired_cached: bool = False
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -124,6 +153,23 @@ class TreeNode:
     @property
     def evicted(self):
         return self.value is None
+    
+    @property
+    def is_expired(self) -> bool:
+        """Check if the node's TTL has expired."""
+        if self.ttl_expiry_time is None:
+            return False
+        current_time = time.monotonic()
+        if current_time > self.last_ttl_check + 1.0:  # Only recalculate every 1 second
+            self._is_expired_cached = current_time > self.ttl_expiry_time
+            self.last_ttl_check = current_time
+        return self._is_expired_cached
+    
+    def set_ttl(self, ttl_sec: float):
+        """Set the TTL for this node."""
+        self.ttl_expiry_time = time.monotonic() + ttl_sec
+        self.last_ttl_check = time.monotonic()
+        self._is_expired_cached = False
 
     @property
     def backuped(self):
@@ -471,8 +517,10 @@ class RadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
+            # DTTL: extract TTL from extra_key and pass to insert
+            ttl_sec = radix_key.get_ttl_sec()
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(key=radix_key, value=values, priority=priority, ttl_sec=ttl_sec)
             )
             new_prefix_len = result.prefix_len
             # Free the duplicates that were already in the tree
@@ -507,12 +555,15 @@ class RadixCache(BasePrefixCache):
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
         # Radix Cache takes one ref in memory pool
+        # DTTL: extract TTL from extra_key and pass to insert
+        ttl_sec = radix_key.get_ttl_sec()
         result = self.insert(
             InsertParams(
                 key=radix_key,
                 value=values,
                 chunked=chunked,
                 priority=getattr(req, "priority", 0) or 0,
+                ttl_sec=ttl_sec,
             )
         )
         new_prefix_len = result.prefix_len

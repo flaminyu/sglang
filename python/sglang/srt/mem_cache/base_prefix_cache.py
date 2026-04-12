@@ -61,6 +61,10 @@ class InsertParams:
     chunked: bool = False
     priority: int = 0
 
+    # DTTL (Dynamic TTL) related
+    # TTL in seconds for this node. If None, TTL is not set.
+    ttl_sec: Optional[float] = None
+
 
 @dataclasses.dataclass
 class InsertResult:

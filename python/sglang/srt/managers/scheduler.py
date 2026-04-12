@@ -149,6 +149,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    ContinuumRequestQueue,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -379,6 +380,9 @@ class Scheduler(
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
+
+        # Init Continuum-style KV Cache pinning
+        self.init_continuum_pin()
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -753,6 +757,8 @@ class Scheduler(
         self.sessions: Dict[str, Session] = {}
         self.forward_sleep_time = None
         self._engine_paused = False
+        # DTTL: Pinned requests list for KV Cache pinning
+        self.pinned_requests: List[Req] = []
 
     def init_chunked_prefill(self):
         # Init chunked prefill
@@ -781,13 +787,26 @@ class Scheduler(
 
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
-        self.policy = SchedulePolicy(
-            self.schedule_policy,
-            self.tree_cache,
-            self.enable_hierarchical_cache,
-            self.enable_priority_scheduling,
-            self.schedule_low_priority_values_first,
-        )
+        # For CONTINUUM policy, inject pinned_requests via continuum_queue
+        if self.schedule_policy == "continuum":
+            continuum_queue = ContinuumRequestQueue()
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+                self.enable_priority_scheduling,
+                self.schedule_low_priority_values_first,
+                continuum_queue=continuum_queue,
+                pinned_requests=self.pinned_requests,
+            )
+        else:
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+                self.enable_priority_scheduling,
+                self.schedule_low_priority_values_first,
+            )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         if self.server_args.enable_prefill_delayer:
             self.prefill_delayer = PrefillDelayer(
@@ -816,6 +835,129 @@ class Scheduler(
             self.init_new_token_ratio - self.min_new_token_ratio
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
+
+    def init_continuum_pin(self):
+        """Initialize Continuum-style KV Cache pinning mechanism."""
+        self.pinned_requests: List[Req] = []
+        logger.info("[Continuum] KV Cache pinning mechanism initialized")
+
+    # =============================================================================
+    # DTTL: KV Cache Pinning Methods
+    # =============================================================================
+    def _extract_ttl_from_extra_key(self, extra_key: Optional[str]) -> Optional[float]:
+        """Extract TTL value from extra_key if it contains Continuum TTL suffix."""
+        if extra_key is None:
+            return None
+        import re
+        match = re.search(r'__ttl=(\d+\.?\d*)', str(extra_key))
+        if match:
+            return float(match.group(1))
+        return None
+
+    def pin_request_kv(self, req: Req, ttl_sec: Optional[float] = None):
+        """Pin request's KV cache to protect it from eviction during tool execution.
+        
+        Args:
+            req: The request to pin
+            ttl_sec: TTL in seconds. If None, extract from req.extra_key
+        """
+        if ttl_sec is None:
+            ttl_sec = self._extract_ttl_from_extra_key(getattr(req, 'extra_key', None))
+        
+        if ttl_sec is None or ttl_sec <= 0:
+            return
+        
+        # Check if already pinned
+        if req in self.pinned_requests:
+            # Update TTL
+            req.pin_expire_time = time.monotonic() + ttl_sec
+            return
+        
+        # Pin the request
+        req.is_pinned = True
+        req.pin_expire_time = time.monotonic() + ttl_sec
+        self.pinned_requests.append(req)
+        
+        # Pin KV cache nodes associated with this request
+        self._pin_req_kv_nodes(req, ttl_sec)
+        
+        logger.debug(
+            f"[Continuum] Pinning request {req.rid} with TTL={ttl_sec:.2f}s, "
+            f"pin_expire_time={req.pin_expire_time:.2f}"
+        )
+
+    def _pin_req_kv_nodes(self, req: Req, ttl_sec: float):
+        """Pin KV cache nodes for a request."""
+        if not hasattr(self.tree_cache, 'inc_lock_ref'):
+            return
+        
+        # Get the last node from this request
+        last_node = getattr(req, 'last_node', None)
+        if last_node is not None:
+            # Set TTL and increment lock_ref to protect from eviction
+            if hasattr(last_node, 'set_ttl'):
+                last_node.set_ttl(ttl_sec)
+            self.tree_cache.inc_lock_ref(last_node)
+
+    def unpin_request_kv(self, req: Req):
+        """Unpin request's KV cache, allowing it to be evicted."""
+        if req not in self.pinned_requests:
+            return
+        
+        self.pinned_requests.remove(req)
+        req.is_pinned = False
+        
+        # Unpin KV cache nodes
+        self._unpin_req_kv_nodes(req)
+        
+        logger.debug(f"[Continuum] Unpinning request {req.rid}")
+
+    def _unpin_req_kv_nodes(self, req: Req):
+        """Unpin KV cache nodes for a request."""
+        if not hasattr(self.tree_cache, 'dec_lock_ref'):
+            return
+        
+        last_node = getattr(req, 'last_node', None)
+        if last_node is not None:
+            self.tree_cache.dec_lock_ref(last_node)
+
+    def cleanup_expired_pins(self):
+        """Clean up expired pins at the start of each scheduling cycle.
+        
+        This is called at the beginning of get_next_batch_to_run() to ensure
+        that expired pinned requests have their KV cache freed.
+        """
+        if not self.pinned_requests:
+            return
+        
+        current_time = time.monotonic()
+        expired_reqs = []
+        
+        for req in self.pinned_requests:
+            if current_time > req.pin_expire_time:
+                expired_reqs.append(req)
+        
+        if expired_reqs:
+            logger.debug(
+                f"[Continuum] Cleaning up {len(expired_reqs)} expired pins"
+            )
+            for req in expired_reqs:
+                self.unpin_request_kv(req)
+
+    def _get_affinity_key(self, req: Req) -> str:
+        """Get affinity key (job_id/program_id) for a request."""
+        # Try to get from conversation_id first
+        conv_id = getattr(req, 'conversation_id', None)
+        if conv_id:
+            return str(conv_id)
+        # Fallback to worker_id from extra_key
+        extra_key = getattr(req, 'extra_key', None) or ""
+        import re
+        match = re.search(r'__continuum_prog=([^_]+)', str(extra_key))
+        if match:
+            return match.group(1)
+        # Fallback to rid
+        return getattr(req, 'rid', 'unknown')[:32]
 
     def init_soft_watchdog(self, server_args: ServerArgs):
         if (x := server_args.soft_watchdog_timeout) is not None:
@@ -1877,6 +2019,9 @@ class Scheduler(
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # DTTL: Clean up expired pins before scheduling
+        self.cleanup_expired_pins()
+        
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:

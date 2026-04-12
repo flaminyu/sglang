@@ -388,7 +388,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
         self._continuum_ttl_history_threshold = max(
             1,
-            int(os.getenv("SGLANG_CONTINUUM_TTL_HISTORY_THRESHOLD", "20") or 20),
+            int(os.getenv("SGLANG_CONTINUUM_TTL_HISTORY_THRESHOLD", "3") or 3),
         )
         self._continuum_prefill_throughput = max(
             1.0,
@@ -442,7 +442,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Paper-style: add minimum queue delay to simulate scheduling overhead
         self._continuum_queue_avg_min_sec = max(
             0.0,
-            float(os.getenv("SGLANG_CONTINUUM_QUEUE_AVG_MIN_SEC", "0") or 0.0),
+            float(os.getenv("SGLANG_CONTINUUM_QUEUE_AVG_MIN_SEC", "0.5") or 0.5),
         )
         self._continuum_queue_avg_weight = max(
             0.0,
@@ -466,6 +466,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self._continuum_global_e2e_history: deque[float] = deque(
             maxlen=ttl_history_maxlen
         )
+        # 全局工具历史：按工具名聚合，支持跨 program 共享
+        self._continuum_global_tool_durations: Dict[str, deque[float]] = {}
 
         # Health check
         self.server_status = ServerStatus.Starting
@@ -529,7 +531,32 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ) -> Dict[str, Any]:
         """Normalize request context extracting program_id and other metadata."""
         raw_ctx = dict(request_context or {})
+        
+        # Parse extra_body for conversation_id and tool_name (passed via litellm extra_body parameter)
+        extra_body = getattr(req, "extra_body", None)
+        extracted_program_id = None
+        extracted_tool_name = None
+        if isinstance(extra_body, dict):
+            if "conversation_id" in extra_body:
+                # conversation_id from extra_body takes highest priority
+                conversation_id = str(extra_body.get("conversation_id", "")).strip()
+                if conversation_id:
+                    extracted_program_id = conversation_id
+            elif "program_id" in extra_body:
+                # Also support direct program_id in extra_body
+                extracted_program_id = str(extra_body.get("program_id", "")).strip()
+            if "tool_name" in extra_body:
+                tool_name_val = str(extra_body.get("tool_name", "")).strip()
+                if tool_name_val:
+                    extracted_tool_name = tool_name_val
+        
+        # Use extracted program_id if available, otherwise use the passed parameter
+        final_program_id = extracted_program_id if extracted_program_id else program_id
+        
+        # tool_name from raw_ctx (HTTP header) takes priority, fallback to extra_body
         tool_name = str(raw_ctx.get("tool_name") or "").strip() or None
+        if not tool_name and extracted_tool_name:
+            tool_name = extracted_tool_name
         task_type = str(raw_ctx.get("task_type") or "").strip() or None
         turn_index = raw_ctx.get("turn_index")
         turn_count = raw_ctx.get("turn_count")
@@ -542,7 +569,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         except Exception:
             turn_count = None
         return {
-            "program_id": program_id,
+            "program_id": final_program_id,
             "tool_name": tool_name,
             "task_type": task_type,
             "turn_index": turn_index,
@@ -610,20 +637,32 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
                 # Track per-tool duration for Continuum paper's P(τ,f)
                 if tool_name:
+                    # Per-program 历史
                     tool_durations = prog_stats.get("tool_durations", {})
                     if tool_name not in tool_durations:
                         tool_durations[tool_name] = deque(maxlen=1024)
                     tool_durations[tool_name].append(idle_gap)
                     prog_stats["tool_durations"] = tool_durations
+                    
+                    # 全局工具历史（跨 program 共享）
+                    if tool_name not in self._continuum_global_tool_durations:
+                        self._continuum_global_tool_durations[tool_name] = deque(maxlen=1024)
+                    self._continuum_global_tool_durations[tool_name].append(idle_gap)
 
             # Use per-tool CDF if available (Continuum paper's approach)
+            # 优先级：全局工具历史 > 程序工具历史 > 全局 idle gap > 程序 idle gap > default
             local_samples = []
             ttl_source = "default"
             if tool_name:
+                global_tool_samples = list(self._continuum_global_tool_durations.get(tool_name, []))
                 tool_durations = prog_stats.get("tool_durations", {})
-                tool_samples = list(tool_durations.get(tool_name, []))
-                if len(tool_samples) >= self._continuum_ttl_history_threshold:
-                    local_samples = tool_samples
+                local_tool_samples = list(tool_durations.get(tool_name, []))
+                
+                if len(global_tool_samples) >= self._continuum_ttl_history_threshold:
+                    local_samples = global_tool_samples
+                    ttl_source = f"global_tool_cdf:{tool_name}"
+                elif len(local_tool_samples) >= self._continuum_ttl_history_threshold:
+                    local_samples = local_tool_samples
                     ttl_source = f"tool_cdf:{tool_name}"
                 elif self._continuum_global_idle_gap_history:
                     local_samples = list(self._continuum_global_idle_gap_history)
@@ -808,6 +847,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         request_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Attach request context extracting program_id from request metadata."""
+        # Extract program_id from extra_body.conversation_id (passed via litellm extra_body parameter)
+        # This must be done BEFORE calling _continuum_normalize_request_context
+        extra_body = getattr(req, "extra_body", None)
+        if isinstance(extra_body, dict) and "conversation_id" in extra_body:
+            req.conversation_id = str(extra_body.get("conversation_id", "")).strip()
+        
         # Extract program_id from conversation_id or use worker_id as fallback
         program_id = str(getattr(req, "conversation_id", "") or worker_id).strip()
         if not program_id:
@@ -839,7 +884,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             worker_id: Optional worker identifier; if None, uses conversation_id
             request_context: Optional context dictionary with metadata
         """
-        # Extract worker_id from request if not provided
+        # Prevent duplicate application: if extra_key already contains Continuum suffix,
+        # this policy has already been applied (e.g., called from both _adapt_chat_request
+        # and normalize_batch)
+        extra_key = getattr(req, "extra_key", None) or ""
+        if "__continuum_prog=" in extra_key:
+            return
         if worker_id is None or worker_id.strip() == "":
             # Try to get worker_id from request metadata
             worker_id = getattr(req, "extra_key", None)
