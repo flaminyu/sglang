@@ -42,8 +42,41 @@ from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.observability.continuum_kv_trace import (
     get_namespace_trace,
     record_namespace_load_back,
+    register_namespace_request,
 )
 from sglang.srt.utils import bind_to_closest_numa_node_cuda
+
+
+# DTTL: 全局请求追踪表，用于关联 evict/load_back 事件与具体请求
+_REQUEST_TRACE: Dict[int, Dict] = {}
+_REQUEST_TRACE_LOCK = threading.Lock()
+
+
+def register_request_trace(req_id: int, program_id: str, tool_name: Optional[str] = None):
+    """注册请求追踪信息"""
+    with _REQUEST_TRACE_LOCK:
+        _REQUEST_TRACE[req_id] = {
+            "program_id": program_id,
+            "tool_name": tool_name,
+            "registered_at": time.time(),
+        }
+
+
+def get_request_trace_by_node_id(node_id: int) -> Dict:
+    """根据 node_id 获取请求追踪信息（通过 node hash 反向查找）"""
+    with _REQUEST_TRACE_LOCK:
+        for trace in _REQUEST_TRACE.values():
+            if trace.get("last_node_id") == node_id:
+                return trace
+        return {}
+
+
+def update_request_trace(req_id: int, **kwargs):
+    """更新请求追踪信息"""
+    with _REQUEST_TRACE_LOCK:
+        if req_id in _REQUEST_TRACE:
+            _REQUEST_TRACE[req_id].update(kwargs)
+
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -919,6 +952,12 @@ class HiRadixCache(RadixCache):
         if node.value is None:
             # Node was already evicted, skip silently
             return 0
+        
+        # 获取 extra_key 用于追踪
+        extra_key = None
+        if node.key is not None:
+            extra_key = node.key.extra_key
+        
         num_evicted = self.cache_controller.evict_device(node.value)
         if num_evicted == 0:
             # Failed to evict (e.g., indices already freed), mark as evicted anyway
@@ -926,12 +965,29 @@ class HiRadixCache(RadixCache):
                 f"evict_device returned 0 for node {node.id}, "
                 f"marking as evicted anyway. host_value={node.host_value is not None}"
             )
+        
         self.evictable_size_ -= num_evicted
         node.value = None
         self._update_leaf_status(node)
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
+        
+        # 记录驱逐事件（关联到 request）
+        if num_evicted > 0 and extra_key:
+            logger.info(
+                "KV_EVICT_EVENT %s",
+                json.dumps({
+                    "ts": round(time.time(), 6),
+                    "node_id": int(node.id),
+                    "num_tokens": int(num_evicted),
+                    "extra_key": extra_key,
+                    "program_id": get_namespace_trace(extra_key).get("program_id"),
+                    "tool_name": get_namespace_trace(extra_key).get("tool_name"),
+                    "ttl_sec": get_namespace_trace(extra_key).get("ttl_sec"),
+                }, ensure_ascii=False, sort_keys=True)
+            )
+        
         return num_evicted
 
     def evict_host(self, num_tokens: int):

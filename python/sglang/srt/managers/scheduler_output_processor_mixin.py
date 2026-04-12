@@ -178,11 +178,18 @@ class SchedulerOutputProcessorMixin:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
                         
-                        # DTTL: Pin KV if request has Continuum TTL (multi-turn with tool calls)
-                        if hasattr(req, 'extra_key') and req.extra_key and '__ttl=' in str(req.extra_key):
+                # DTTL: Pin KV if request has Continuum TTL (multi-turn with tool calls)
+                        extra_key_str = str(req.extra_key) if hasattr(req, 'extra_key') and req.extra_key else ""
+                        has_ttl_suffix = '__ttl=' in extra_key_str
+                        if has_ttl_suffix:
                             ttl_sec = self._extract_ttl_from_extra_key(req.extra_key)
                             if ttl_sec and ttl_sec > 0:
+                                logger.info(
+                                    f"[Continuum] Prefill: Calling pin_request_kv for req {req.rid} with TTL={ttl_sec:.2f}s"
+                                )
                                 self.pin_request_kv(req, ttl_sec)
+                        elif extra_key_str:
+                            logger.info(f"[Continuum] Prefill: No TTL in extra_key for req {req.rid}: {extra_key_str[:100]}")
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -478,10 +485,17 @@ class SchedulerOutputProcessorMixin:
                 req.time_stats.set_completion_time()
             else:
                 # DTTL: Pin KV if request has Continuum TTL (multi-turn with tool calls)
-                if hasattr(req, 'extra_key') and req.extra_key and '__ttl=' in str(req.extra_key):
+                extra_key_str = str(req.extra_key) if hasattr(req, 'extra_key') and req.extra_key else ""
+                has_ttl_suffix = '__ttl=' in extra_key_str
+                if has_ttl_suffix:
                     ttl_sec = self._extract_ttl_from_extra_key(req.extra_key)
                     if ttl_sec and ttl_sec > 0:
+                        logger.info(
+                            f"[Continuum] Decode: Calling pin_request_kv for req {req.rid} with TTL={ttl_sec:.2f}s"
+                        )
                         self.pin_request_kv(req, ttl_sec)
+                elif extra_key_str:
+                    logger.info(f"[Continuum] Decode: No TTL in extra_key for req {req.rid}: {extra_key_str[:100]}")
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
