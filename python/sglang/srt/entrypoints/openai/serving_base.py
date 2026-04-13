@@ -313,6 +313,10 @@ class OpenAIServingBase(ABC):
         adapted_request: Union[GenerateReqInput, EmbeddingReqInput],
         raw_request: Optional[Request],
     ) -> None:
+        # 如果 continuum_ttl_sec 未设置或为 0，完全禁用 Continuum TTL 机制
+        if not getattr(self.tokenizer_manager.server_args, "continuum_ttl_sec", None):
+            return
+
         worker_id = self.extract_continuum_worker_id(raw_request)
         if not worker_id:
             return

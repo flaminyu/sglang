@@ -377,7 +377,7 @@ def run_offline_profiling(
         decode_latency_per_token=decode_latency_per_token,
         t_queue_delay=t_queue_delay,
         prefill_reload_cost=prefill_reload_cost,
-        kv_load_back_speed=kv_load_back_speed,
+        kv_load_back_speed_gb_s=kv_load_back_speed,
         max_tokens_in_memory=max_tokens_in_memory,
         kv_bytes_per_token=kv_bytes_per_token,
     )
@@ -410,7 +410,7 @@ def print_profiling_result(result: ProfilingResult) -> None:
     print(f"\n[Continuum Parameters]")
     print(f"  T (queue delay): {result.t_queue_delay*1000:.4f} ms")
     print(f"  Prefill/Reload: {result.prefill_reload_cost:.4f} sec per 1K tokens")
-    print(f"  KV Load Back:    {result.kv_load_back_speed:.1f} GB/s")
+    print(f"  KV Load Back:    {result.kv_load_back_speed_gb_s:.1f} GB/s")
 
     print(f"\n[Memory Estimation]")
     print(f"  KV bytes/token:  {result.kv_bytes_per_token:.0f} bytes")

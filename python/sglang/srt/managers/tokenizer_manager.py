@@ -349,13 +349,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             64,
             int(os.getenv("SGLANG_CONTINUUM_TTL_HISTORY_MAXLEN", "4096") or 4096),
         )
+        # Allow TTL values down to 0 to fully disable TTL in baseline mode
         self._continuum_ttl_default_sec = max(
-            0.5,
-            float(os.getenv("SGLANG_CONTINUUM_TTL_DEFAULT_SEC", "15") or 15.0),
+            0.0,
+            float(os.getenv("SGLANG_CONTINUUM_TTL_DEFAULT_SEC", "0") or 0.0),
         )
         self._continuum_ttl_min_sec = max(
-            0.25,
-            float(os.getenv("SGLANG_CONTINUUM_TTL_MIN_SEC", "2") or 2.0),
+            0.0,  # Allow 0 to disable TTL entirely
+            float(os.getenv("SGLANG_CONTINUUM_TTL_MIN_SEC", "0") or 0.0),
         )
         self._continuum_ttl_max_sec = max(
             self._continuum_ttl_min_sec,
