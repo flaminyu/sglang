@@ -851,67 +851,42 @@ class HiRadixCache(RadixCache):
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
         
-        # DTTL: 两阶段驱逐策略
-        # 第一阶段：优先驱逐 TTL 已过期的节点
-        expired_nodes = []
-        normal_heap = []
+        # DTTL: 统一 LRU 驱逐策略
+        # 过期节点降级参与 LRU（优先级降低），但不是立即驱逐
+        # 这样保留 load back 的机会
+        eviction_heap = []
         
         for node in leaves:
-            # 检查 TTL 是否过期（lock_ref 必须为 0）
-            if node.is_expired and node.lock_ref == 0 and node.value is not None:
-                expired_nodes.append(node)
+            # 跳过正在使用的节点
+            if node.lock_ref > 0:
+                continue
+            # 跳过已驱逐的节点
+            if node.value is None:
+                continue
+            
+            # 过期节点降低优先级（排到 LRU 末尾），但不立即驱逐
+            if node.is_expired:
+                # 使用一个远小于正常优先级的值
+                # 正常 priority 是时间戳（越大越优先），过期节点用极小值
+                priority = -1e18 + node.creation_time
             else:
-                # 正常的 LRU/LFU 驱逐
                 priority = self.eviction_strategy.get_priority(node)
-                heapq.heappush(normal_heap, (priority, node))
+            heapq.heappush(eviction_heap, (priority, node))
         
-        # 执行两阶段驱逐
         num_evicted = 0
         write_back_nodes = []
         
-        # 第一阶段：驱逐已过期的节点
-        for x in expired_nodes:
-            if num_evicted >= num_tokens:
-                break
-            if x.value is None:
-                continue
-                
-            if not x.backuped:
-                if self.cache_controller.write_policy == "write_back":
-                    num_evicted += self.write_backup(x, write_back=True)
-                    write_back_nodes.append(x)
-                else:
-                    num_evicted += self._evict_regular(x)
-            else:
-                num_evicted += self._evict_backuped(x)
-                
-            # 更新父节点状态
-            for child in x.parent.children.values():
-                if child in write_back_nodes:
-                    continue
-                if not child.evicted:
-                    break
-            else:
-                # 所有子节点都已驱逐或没有子节点
-                if x.parent in expired_nodes:
-                    continue
-                if x.parent.lock_ref == 0 and x.parent.value is not None:
-                    expired_nodes.append(x.parent)
-        
-        # 第二阶段：如果还没驱逐够，按 LRU/LFU 驱逐
-        while num_evicted < num_tokens and len(normal_heap):
-            _priority, x = heapq.heappop(normal_heap)
+        # 按 LRU 驱逐（过期节点排在最后）
+        while num_evicted < num_tokens and len(eviction_heap):
+            _priority, x = heapq.heappop(eviction_heap)
 
             if x.lock_ref > 0:
                 continue
-
-            # Skip already evicted nodes
             if x.value is None:
                 continue
 
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
-                    # write to host if the node is not backuped
                     num_evicted += self.write_backup(x, write_back=True)
                     write_back_nodes.append(x)
                 else:
@@ -925,9 +900,17 @@ class HiRadixCache(RadixCache):
                 if not child.evicted:
                     break
             else:
-                # all children are evicted or no children
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(normal_heap, (new_priority, x.parent))
+                # 所有子节点都已驱逐，父节点也参与 LRU
+                if x.parent.lock_ref > 0 or x.parent == self.root_node:
+                    continue
+                if x.parent.value is None:
+                    continue
+                # 父节点优先级也要考虑是否过期
+                if x.parent.is_expired:
+                    new_priority = -1e18 + x.parent.creation_time
+                else:
+                    new_priority = self.eviction_strategy.get_priority(x.parent)
+                heapq.heappush(eviction_heap, (new_priority, x.parent))
 
         if self.cache_controller.write_policy == "write_back":
             self.writing_check(write_back=True)
@@ -955,8 +938,11 @@ class HiRadixCache(RadixCache):
         
         # 获取 extra_key 用于追踪
         extra_key = None
+        ttl_sec_from_node = None
         if node.key is not None:
             extra_key = node.key.extra_key
+            # DTTL: Try to extract TTL directly from the node's RadixKey
+            ttl_sec_from_node = node.key.get_ttl_sec()
         
         num_evicted = self.cache_controller.evict_device(node.value)
         if num_evicted == 0:
@@ -975,6 +961,13 @@ class HiRadixCache(RadixCache):
         
         # 记录驱逐事件（关联到 request）
         if num_evicted > 0 and extra_key:
+            # DTTL: Fallback to TTL extracted directly from node if trace doesn't have it
+            trace = get_namespace_trace(extra_key)
+            ttl_sec = trace.get("ttl_sec") if trace else None
+            if ttl_sec is None and ttl_sec_from_node is not None:
+                ttl_sec = ttl_sec_from_node
+            ttl_source = trace.get("ttl_source") if trace and trace.get("ttl_source") else ("node_radix_key" if ttl_sec_from_node else None)
+            
             logger.info(
                 "KV_EVICT_EVENT %s",
                 json.dumps({
@@ -982,9 +975,10 @@ class HiRadixCache(RadixCache):
                     "node_id": int(node.id),
                     "num_tokens": int(num_evicted),
                     "extra_key": extra_key,
-                    "program_id": get_namespace_trace(extra_key).get("program_id"),
-                    "tool_name": get_namespace_trace(extra_key).get("tool_name"),
-                    "ttl_sec": get_namespace_trace(extra_key).get("ttl_sec"),
+                    "program_id": trace.get("program_id") if trace else None,
+                    "tool_name": trace.get("tool_name") if trace else None,
+                    "ttl_sec": ttl_sec,
+                    "ttl_source": ttl_source,
                 }, ensure_ascii=False, sort_keys=True)
             )
         
@@ -1084,8 +1078,12 @@ class HiRadixCache(RadixCache):
         bytes_per_token = self._get_load_back_bytes_per_token()
         load_back_bytes = int(round(len(device_indices) * bytes_per_token)) if bytes_per_token > 0 else 0
         extra_key = None
+        ttl_sec_from_node = None
         if last_hit_node.key is not None:
             extra_key = last_hit_node.key.extra_key
+            # DTTL: Try to extract TTL directly from the node's RadixKey
+            ttl_sec_from_node = last_hit_node.key.get_ttl_sec()
+        
         trace_ctx = record_namespace_load_back(
             extra_key,
             node_id=int(last_hit_node.id),
@@ -1095,7 +1093,15 @@ class HiRadixCache(RadixCache):
         )
         if not trace_ctx:
             trace_ctx = get_namespace_trace(extra_key)
-
+        
+        # DTTL: Fallback to TTL extracted directly from node if trace_ctx doesn't have it
+        ttl_sec = trace_ctx.get("ttl_sec") if trace_ctx else None
+        if ttl_sec is None and ttl_sec_from_node is not None:
+            ttl_sec = ttl_sec_from_node
+            ttl_source = "node_radix_key"
+        else:
+            ttl_source = trace_ctx.get("ttl_source") if trace_ctx else None
+        
         logger.info(
             "KV_LOAD_BACK_EVENT %s",
             json.dumps(
@@ -1110,14 +1116,14 @@ class HiRadixCache(RadixCache):
                     "duration_sec": round(load_back_duration, 6),
                     "size_source": "host_pool_size_per_token",
                     "extra_key": extra_key,
-                    "program_id": trace_ctx.get("program_id"),
-                    "tool_name": trace_ctx.get("tool_name"),
-                    "task_type": trace_ctx.get("task_type"),
-                    "prompt_excerpt": trace_ctx.get("prompt_excerpt"),
-                    "output_excerpt": trace_ctx.get("output_excerpt"),
-                    "ttl_sec": trace_ctx.get("ttl_sec"),
-                    "ttl_source": trace_ctx.get("ttl_source"),
-                    "last_queueing_sec": trace_ctx.get("last_queueing_sec"),
+                    "program_id": trace_ctx.get("program_id") if trace_ctx else None,
+                    "tool_name": trace_ctx.get("tool_name") if trace_ctx else None,
+                    "task_type": trace_ctx.get("task_type") if trace_ctx else None,
+                    "prompt_excerpt": trace_ctx.get("prompt_excerpt") if trace_ctx else None,
+                    "output_excerpt": trace_ctx.get("output_excerpt") if trace_ctx else None,
+                    "ttl_sec": ttl_sec,
+                    "ttl_source": ttl_source,
+                    "last_queueing_sec": trace_ctx.get("last_queueing_sec") if trace_ctx else None,
                 },
                 ensure_ascii=False,
                 sort_keys=True,

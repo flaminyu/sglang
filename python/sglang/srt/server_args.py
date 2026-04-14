@@ -3272,7 +3272,8 @@ class ServerArgs:
             type=float,
             default=None,
             help="Enable Continuum TTL policy with specified default TTL in seconds. "
-            "When set, KV cache will be automatically evicted after TTL expires.",
+            "TTL is only applied when tool_name is present in the request. "
+            "Requests without tool_name use default LRU eviction.",
         )
         parser.add_argument(
             "--schedule-conservativeness",

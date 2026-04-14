@@ -332,9 +332,12 @@ def random_uuid() -> str:
 _warned_bool_env_var_keys = set()
 
 
-def get_bool_env_var(name: str, default: str = "false") -> bool:
+def get_bool_env_var(name: str, default: str | bool = "false") -> bool:
     # FIXME: move your environment variable to sglang.srt.environ
     value = os.getenv(name, default)
+    # Handle bool default values (convert to string)
+    if isinstance(value, bool):
+        return value
     value = value.lower()
 
     truthy_values = ("true", "1")

@@ -395,6 +395,29 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             1.0,
             float(os.getenv("SGLANG_CONTINUUM_PREFILL_THROUGHPUT", "0") or 0.0),
         )
+        # Initialize queue_avg_min_sec BEFORE auto-profiling (fixes attribute order bug)
+        self._continuum_queue_avg_min_sec = max(
+            0.0,
+            float(os.getenv("SGLANG_CONTINUUM_QUEUE_AVG_MIN_SEC", "0.5") or 0.5),
+        )
+        self._continuum_queue_avg_cap_sec = max(
+            0.0,
+            float(os.getenv("SGLANG_CONTINUUM_QUEUE_AVG_CAP_SEC", "0") or 0.0),
+        )
+        self._continuum_queue_avg_weight = max(
+            0.0,
+            float(os.getenv("SGLANG_CONTINUUM_QUEUE_AVG_WEIGHT", "1.0") or 1.0),
+        )
+        self._continuum_memory_pressure_penalty = max(
+            0.0,
+            float(os.getenv("SGLANG_CONTINUUM_MEMORY_PRESSURE_PENALTY", "0.3") or 0.3),
+        )
+        self._continuum_real_memory_enabled = get_bool_env_var(
+            "SGLANG_CONTINUUM_REAL_MEMORY_ENABLED", False
+        )
+        self._continuum_last_memory_usage = 0.5
+        self._continuum_last_memory_check = 0.0
+
         # Auto-run offline profiling if prefill throughput not set
         if self._continuum_prefill_throughput <= 1.0:
             try:
@@ -416,9 +439,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     mem_fraction_kv=getattr(self.server_args, "mem_fraction_static", 0.8) * 0.3,
                 )
                 self._continuum_prefill_throughput = profiling_result.prefill_throughput
-                # Set queue delay from profiling
-                if self._continuum_queue_avg_min_sec <= 0.0:
-                    self._continuum_queue_avg_min_sec = profiling_result.t_queue_delay
+                # Update queue delay from profiling
+                self._continuum_queue_avg_min_sec = max(
+                    self._continuum_queue_avg_min_sec,
+                    profiling_result.t_queue_delay
+                )
                 logger.info(
                     "[Continuum] Auto-profiled parameters: "
                     "prefill_throughput=%.1f tokens/s, "
@@ -653,11 +678,29 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # Use per-tool CDF if available (Continuum paper's approach)
             # 优先级：全局工具历史 > 程序工具历史 > 全局 idle gap > 程序 idle gap > default
             local_samples = []
-            ttl_source = "default"
-            if tool_name:
-                global_tool_samples = list(self._continuum_global_tool_durations.get(tool_name, []))
-                tool_durations = prog_stats.get("tool_durations", {})
-                local_tool_samples = list(tool_durations.get(tool_name, []))
+        ttl_source = "default"
+
+        # Initialize defaults for non-tool requests (queue_avg, active_progs, eta)
+        # These are needed because they are used after the if tool_name: block
+        queue_avg = self._continuum_mean(list(self._continuum_global_queue_time_history))
+        active_progs = 0
+        eta = 1.0  # Default memoryfulness factor (neutral)
+
+        if tool_name:
+            global_tool_samples = list(self._continuum_global_tool_durations.get(tool_name, []))
+            tool_durations = prog_stats.get("tool_durations", {})
+            local_tool_samples = list(tool_durations.get(tool_name, []))
+            
+            # [DEBUG] Log tool duration distribution
+            if global_tool_samples:
+                import statistics
+                mean_tool = statistics.mean(global_tool_samples) if global_tool_samples else 0
+                median_tool = statistics.median(global_tool_samples) if global_tool_samples else 0
+                logger.info(
+                    f"[Continuum][TOOL_DEBUG] tool={tool_name} samples={len(global_tool_samples)} "
+                    f"mean={mean_tool:.3f}s median={median_tool:.3f}s "
+                    f"min={min(global_tool_samples):.3f}s max={max(global_tool_samples):.3f}s"
+                )
                 
                 if len(global_tool_samples) >= self._continuum_ttl_history_threshold:
                     local_samples = global_tool_samples
@@ -802,6 +845,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Where P(τ, f) is the CDF: probability that tool f finishes ≤ τ
         best_ttl = candidate_ttls[0]
         best_score = float("-inf")
+        
+        # [DEBUG] Log all candidate evaluations
+        debug_eval = []  # Collect for batch logging
+        
         for candidate in candidate_ttls:
             # P(τ, f) = probability tool finishes within τ
             probability = sum(1 for sample in local_samples if sample <= candidate) / len(local_samples)
@@ -812,12 +859,44 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # Paper's utility: P(τ,f) × benefit - cost
             # Cost = (MemUsage/M) × τ ≈ ttl_cost_multiplier × τ
             score = probability * benefit - candidate * ttl_cost_multiplier - reload_penalty
+            
+            debug_eval.append({
+                "ttl": candidate,
+                "P(hit)": probability,
+                "benefit": benefit,
+                "cost": candidate * ttl_cost_multiplier,
+                "reload_penalty": reload_penalty,
+                "score": score,
+            })
 
             if score > best_score or (
                 abs(score - best_score) <= 1e-9 and candidate < best_ttl
             ):
                 best_ttl = candidate
                 best_score = score
+        
+        # [DEBUG] Log all candidate evaluations
+        logger.info(
+            "[Continuum][TTL_DEBUG] tool=%s samples=%d candidates=%d best_ttl=%.3f best_score=%.4f memory_pressure=%.4f",
+            tool_name,
+            len(local_samples),
+            len(candidate_ttls),
+            best_ttl,
+            best_score,
+            estimated_memory_pressure,
+        )
+        # Log top 5 candidates
+        debug_sorted = sorted(debug_eval, key=lambda x: -x["score"])[:5]
+        for i, eval_data in enumerate(debug_sorted):
+            logger.info(
+                "[Continuum][TTL_DEBUG]   [%d] ttl=%.3f P=%.3f benefit=%.4f cost=%.4f score=%.4f",
+                i + 1,
+                eval_data["ttl"],
+                eval_data["P(hit)"],
+                eval_data["benefit"],
+                eval_data["cost"],
+                eval_data["score"],
+            )
 
         return (
             max(self._continuum_ttl_min_sec, min(best_ttl, self._continuum_ttl_max_sec)),
@@ -880,6 +959,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         calculate optimal TTL based on historical tool execution times and apply it
         to the KV cache for reuse in subsequent turns.
         
+        NOTE: TTL is only applied when tool_name is present. Requests without tool
+        calls use the default eviction mechanism (LRU via HiCache).
+        
         Args:
             req: The request object (GenerateReqInput or EmbeddingReqInput)
             worker_id: Optional worker identifier; if None, uses conversation_id
@@ -900,6 +982,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         ctx = self.continuum_attach_request_context(req, worker_id, request_context)
         program_id = ctx.get("program_id", worker_id)
+        tool_name = ctx.get("tool_name")
+
+        # CRITICAL: Only apply TTL policy for requests with tool calls.
+        # For requests without tool_name, use the default eviction mechanism (LRU).
+        if not tool_name:
+            logger.info(
+                "[Continuum] Skipping TTL policy: no tool_name detected, using default eviction"
+            )
+            return
 
         # Calculate TTL based on Continuum paper's utility model
         computed_ttl_sec, ttl_source, ttl_debug = self._continuum_select_dynamic_ttl(
@@ -908,6 +999,36 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             None,  # No prospective extra_key needed
             ctx=ctx,
         )
+
+        # If TTL source is "default" (no history), use default_ttl for tool requests
+        # This ensures TTL policy is applied even for the first request with tool_name
+        if ttl_source == "default":
+            if tool_name:
+                # For tool requests without history, use default TTL to enable the policy
+                computed_ttl_sec = self._continuum_ttl_default_sec
+                if computed_ttl_sec <= 0:
+                    # Use a reasonable default if not configured
+                    computed_ttl_sec = 3.0
+                ttl_source = "default_fallback"
+                logger.info(
+                    "[Continuum] Using default TTL=%.3f for tool request (no history yet)",
+                    computed_ttl_sec,
+                )
+            else:
+                # For non-tool requests with no history, skip TTL policy
+                logger.info(
+                    "[Continuum] Skipping TTL policy: no tool_name and no history (source=%s)",
+                    ttl_source,
+                )
+                return
+        
+        # If TTL is still invalid, skip
+        if computed_ttl_sec <= 0:
+            logger.info(
+                "[Continuum] Skipping TTL policy: TTL=%.3f is invalid",
+                computed_ttl_sec,
+            )
+            return
 
         # Build suffix for extra_key: includes program_id and computed TTL
         suffix = f"__continuum_prog={program_id}__ttl={round(computed_ttl_sec, 3)}"
@@ -920,7 +1041,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 {
                     "worker_id": worker_id,
                     "program_id": program_id,
-                    "tool_name": ctx.get("tool_name"),
+                    "tool_name": tool_name,
                     "ttl_sec": round(computed_ttl_sec, 6),
                     "ttl_source": ttl_source,
                     **ttl_debug,
@@ -934,7 +1055,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         register_namespace_request(
             req.extra_key,
             program_id=program_id,
-            tool_name=ctx.get("tool_name"),
+            tool_name=tool_name,
             task_type=ctx.get("task_type"),
             prompt_text=self._continuum_prompt_excerpt(req),
             turn_index=ctx.get("turn_index"),
@@ -1084,9 +1205,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Normalize the request
         obj.normalize_batch_and_arguments()
 
-        # 应用 Continuum TTL 策略（如果启用）
+        # 应用 Continuum TTL 策略（只有 schedule_policy="continuum" 时启用）
         # 这会在请求的 extra_key 中添加 TTL 信息，用于 KV 缓存管理
-        if self.server_args.continuum_ttl_sec is not None and self.server_args.continuum_ttl_sec > 0:
+        if getattr(self.server_args, "schedule_policy", None) == "continuum":
             self.continuum_apply_policy_to_request(obj, worker_id=None)
 
         self._req_stats_init(obj, request)

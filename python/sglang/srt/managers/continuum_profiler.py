@@ -186,19 +186,17 @@ def estimate_prefill_throughput(
     Estimate prefill throughput (tokens/sec).
 
     Prefill is compute-bound:
-        tokens/sec = (FP16 TFLOPS × efficiency) / (2 × Parameters × Ops_per_token)
+        tokens/sec = (FP16 TFLOPS × efficiency) / FLOPs_per_token
 
-    For transformer: ~2 FLOPs per parameter per token per layer
+    FLOPs_per_token ≈ 2 × num_parameters (forward pass per token)
     """
-    ops_per_token_per_layer = 2 * model_info.hidden_size
-    ops_per_token = ops_per_token_per_layer * model_info.num_layers
-    # + attention projection overhead
-    ops_per_token *= 1.2
-
     tflops_effective = gpu_info.fp16_tflops * efficiency_factor
     flops_per_sec = tflops_effective * 1e12
 
-    throughput = flops_per_sec / (2 * model_info.num_parameters * ops_per_token)
+    # FLOPs per token ≈ 2 × num_parameters
+    flops_per_token = 2.0 * model_info.num_parameters
+
+    throughput = flops_per_sec / flops_per_token
 
     return max(throughput, 1.0)  # At least 1 token/sec
 
@@ -226,37 +224,23 @@ def estimate_t_queue_delay(
     prefill_throughput: float,
     decode_throughput: float,
     avg_batch_size: int = 4,
-    system_overhead_sec: float = 0.01,
+    system_overhead_sec: float = 0.001,
 ) -> float:
     """
     Estimate T (average queueing delay per unit memory).
 
-    This estimates the scheduling overhead per token in the queue.
-    T represents the cost of keeping KV in GPU vs. letting it spill.
-
-    Based on Continuum paper's offline profiling approach:
-    - Measure how long a request waits in queue when others are running
-    - This depends on the GPU's ability to switch between requests
-
-    In practice:
-    - With batching: higher throughput, lower queueing
-    - With context: longer prefill blocks others
-
-    Estimated as:
-        T ≈ 1/throughput × batch_penalty × system_overhead
+    T represents the base scheduling overhead per token.
+    Based on Continuum paper, T is typically in the range of 0.5-5ms.
     """
-    # Average time to process one batch
-    avg_processing_time = 1.0 / prefill_throughput + 1.0 / decode_throughput
-
-    # Queueing delay increases with more concurrent requests
-    # Assumes FCFS with some batching
-    batch_penalty = max(1.0, avg_batch_size * 0.5)
+    # Prefill time per token (in seconds)
+    prefill_time_per_token = 1.0 / prefill_throughput if prefill_throughput > 0 else 1.0
 
     # System overhead (scheduler, memory manager, etc.)
-    T = avg_processing_time * batch_penalty + system_overhead_sec
+    # Typical value: 1-5ms
+    T = max(prefill_time_per_token, system_overhead_sec)
 
-    # Cap T at reasonable values (0.001 to 1.0 seconds)
-    return max(0.001, min(T, 1.0))
+    # Cap T at reasonable values (0.0005 to 0.005 seconds = 0.5 to 5 ms)
+    return max(0.0005, min(T, 0.005))
 
 
 def estimate_kv_load_back_speed(

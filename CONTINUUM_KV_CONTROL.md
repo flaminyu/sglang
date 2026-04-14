@@ -59,11 +59,11 @@ Continuum 引入了 **Time-To-Live (TTL)** 机制：
 ## 3) 配置参数（环境变量）
 
 ```bash
-# TTL 默认值（秒）
-SGLANG_CONTINUUM_TTL_DEFAULT_SEC=15
+# TTL 默认值（秒）- 设为 0 表示无历史数据时不应用 TTL
+SGLANG_CONTINUUM_TTL_DEFAULT_SEC=0
 
-# TTL 最小值（秒）
-SGLANG_CONTINUUM_TTL_MIN_SEC=2
+# TTL 最小值（秒）- 设为 0 表示不禁用 TTL
+SGLANG_CONTINUUM_TTL_MIN_SEC=0
 
 # TTL 最大值（秒）
 SGLANG_CONTINUUM_TTL_MAX_SEC=90
@@ -83,6 +83,11 @@ SGLANG_CONTINUUM_TTL_TOOL_DELAY_RATIO=1.5
 # 内存压力惩罚系数
 SGLANG_CONTINUUM_MEMORY_PRESSURE_PENALTY=0.3
 ```
+
+**重要说明**：
+- TTL 只在请求包含 `tool_name` 时才应用
+- 无 `tool_name` 或无历史数据时，使用默认 LRU 驱逐机制
+- `DEFAULT_SEC=0` 表示无历史数据时不强制设置 TTL
 
 ## 4) 客户端使用方式
 

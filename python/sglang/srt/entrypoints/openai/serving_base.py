@@ -313,14 +313,25 @@ class OpenAIServingBase(ABC):
         adapted_request: Union[GenerateReqInput, EmbeddingReqInput],
         raw_request: Optional[Request],
     ) -> None:
-        # 如果 continuum_ttl_sec 未设置或为 0，完全禁用 Continuum TTL 机制
-        if not getattr(self.tokenizer_manager.server_args, "continuum_ttl_sec", None):
+        # 检查 schedule_policy 是否为 continuum（只有 continuum 模式才启用 TTL 策略）
+        # 注意：TTL 是否实际应用到请求由 tool_name 检查决定
+        schedule_policy = getattr(self.tokenizer_manager.server_args, "schedule_policy", None)
+        if schedule_policy != "continuum":
             return
-
+        
+        # 检查 worker_id 是否存在（用于 Continuum KV keying）
         worker_id = self.extract_continuum_worker_id(raw_request)
         if not worker_id:
             return
+        
         request_context = self.extract_continuum_request_context(raw_request)
+        tool_name = request_context.get("tool_name") if request_context else None
+        
+        # 如果没有 tool_name，跳过 TTL 策略（使用默认 LRU）
+        if not tool_name:
+            return
+        
+        # 有 tool_name 且 schedule_policy 是 continuum，应用 TTL 策略
         if hasattr(self.tokenizer_manager, "continuum_apply_policy_to_request"):
             self.tokenizer_manager.continuum_apply_policy_to_request(
                 adapted_request,

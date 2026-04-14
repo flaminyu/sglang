@@ -184,9 +184,6 @@ class SchedulerOutputProcessorMixin:
                         if has_ttl_suffix:
                             ttl_sec = self._extract_ttl_from_extra_key(req.extra_key)
                             if ttl_sec and ttl_sec > 0:
-                                logger.info(
-                                    f"[Continuum] Prefill: Calling pin_request_kv for req {req.rid} with TTL={ttl_sec:.2f}s"
-                                )
                                 self.pin_request_kv(req, ttl_sec)
                         elif extra_key_str:
                             logger.info(f"[Continuum] Prefill: No TTL in extra_key for req {req.rid}: {extra_key_str[:100]}")
@@ -490,9 +487,6 @@ class SchedulerOutputProcessorMixin:
                 if has_ttl_suffix:
                     ttl_sec = self._extract_ttl_from_extra_key(req.extra_key)
                     if ttl_sec and ttl_sec > 0:
-                        logger.info(
-                            f"[Continuum] Decode: Calling pin_request_kv for req {req.rid} with TTL={ttl_sec:.2f}s"
-                        )
                         self.pin_request_kv(req, ttl_sec)
                 elif extra_key_str:
                     logger.info(f"[Continuum] Decode: No TTL in extra_key for req {req.rid}: {extra_key_str[:100]}")

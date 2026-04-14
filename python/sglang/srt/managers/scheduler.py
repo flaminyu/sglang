@@ -881,9 +881,11 @@ class Scheduler(
         # Pin KV cache nodes associated with this request
         self._pin_req_kv_nodes(req, ttl_sec)
         
-        logger.debug(
-            f"[Continuum] Pinning request {req.rid} with TTL={ttl_sec:.2f}s, "
-            f"pin_expire_time={req.pin_expire_time:.2f}"
+        # Get job info for logging
+        job_time = getattr(req, 'job_first_entry_time', 0)
+        logger.info(
+            f"[Continuum][PIN] rid={req.rid} TTL={ttl_sec:.2f}s job_time={job_time:.3f} "
+            f"total_pinned={len(self.pinned_requests)}"
         )
 
     def _pin_req_kv_nodes(self, req: Req, ttl_sec: float):
@@ -943,6 +945,57 @@ class Scheduler(
             )
             for req in expired_reqs:
                 self.unpin_request_kv(req)
+
+    def prevent_pinned_deadlock(self, adder) -> bool:
+        """
+        Prevent deadlock when pinned requests occupy all GPU memory.
+        
+        According to Continuum paper Section 5.2:
+        "If deadlock occurs (all GPU memory occupied by pinned requests),
+        iteratively select victims from pinned_requests (latest program arrival 
+        time first) to unpin and free space until first request can be scheduled."
+        
+        Returns True if we successfully freed space for scheduling.
+        Returns False if no pinned requests to unpin.
+        """
+        if not self.pinned_requests:
+            return False
+        
+        logger.warning(
+            f"[Continuum] Deadlock prevention: {len(self.pinned_requests)} pinned requests, "
+            f"attempting to unpin oldest to free space"
+        )
+        
+        # Sort by job_first_entry_time (oldest first = lower priority to keep)
+        # We want to unpin the requests that arrived earliest (lowest priority)
+        # because they are most likely to be "stale"
+        sorted_pinned = sorted(
+            self.pinned_requests,
+            key=lambda r: getattr(r, 'job_first_entry_time', float('inf'))
+        )
+        
+        freed_count = 0
+        for req in sorted_pinned:
+            job_time = getattr(req, 'job_first_entry_time', 0)
+            logger.warning(
+                f"[Continuum] Deadlock prevention: unpinnning {req.rid} "
+                f"(job_entry_time={job_time:.3f}, ttl_expire={req.pin_expire_time - time.monotonic():.2f}s)"
+            )
+            self.unpin_request_kv(req)
+            freed_count += 1
+            
+            # Check if we freed enough space
+            # Try to add a minimal request to test if scheduling is possible
+            if freed_count >= len(self.pinned_requests):
+                break
+        
+        if freed_count > 0:
+            logger.warning(
+                f"[Continuum] Deadlock prevention: unpinned {freed_count} requests"
+            )
+            return True
+        
+        return False
 
     def _get_affinity_key(self, req: Req) -> str:
         """Get affinity key (job_id/program_id) for a request."""
@@ -2226,9 +2279,13 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
 
             if self.running_batch.batch_is_full:
-                if not self.try_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
-                ):
+                if self.try_preemption and self.pinned_requests:
+                    # Try deadlock prevention: unpin oldest pinned requests first
+                    if self.prevent_pinned_deadlock(adder):
+                        self.running_batch.batch_is_full = False
+                        continue
+                
+                if not adder.preempt_to_schedule(req, self.server_args):
                     break
 
             if self.enable_hicache_storage:
