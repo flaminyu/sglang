@@ -4,7 +4,18 @@
 import os
 import re
 
-project_root = "/data/home/sczd795/run/KVbloking/sglang_continuum"
+# 自动检测项目根目录 (tools/sglang-simulator/ -> sglang_continuum/)
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(os.path.dirname(_script_dir))  # sglang_continuum
+
+def get_project_root():
+    """获取项目根目录，优先使用环境变量"""
+    env_root = os.environ.get('SGLANG_PROJECT_ROOT')
+    if env_root and os.path.exists(env_root):
+        return env_root
+    return _project_root
+
+project_root = get_project_root()
 
 def check_ttl_methods_in_scheduler():
     """Check TTL methods exist in scheduler.py"""

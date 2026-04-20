@@ -662,18 +662,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 prog_stats["last_gap_origin_finish_ts"] = float(last_finish_ts)
 
                 # Track per-tool duration for Continuum paper's P(τ,f)
+                # FIX: Use actual tool_execution_time from extra_body instead of idle_gap
+                # This follows the Continuum paper's approach where we track actual tool execution times
+                tool_execution_time = None
+                extra_body = getattr(req, "extra_body", None)
+                if isinstance(extra_body, dict) and "tool_execution_time" in extra_body:
+                    tool_execution_time = float(extra_body.get("tool_execution_time", 0))
+                
                 if tool_name:
                     # Per-program 历史
                     tool_durations = prog_stats.get("tool_durations", {})
                     if tool_name not in tool_durations:
                         tool_durations[tool_name] = deque(maxlen=1024)
-                    tool_durations[tool_name].append(idle_gap)
+                    # Use actual tool execution time if available, otherwise use idle_gap as fallback
+                    recorded_duration = tool_execution_time if tool_execution_time and tool_execution_time > 0 else idle_gap
+                    tool_durations[tool_name].append(recorded_duration)
                     prog_stats["tool_durations"] = tool_durations
                     
                     # 全局工具历史（跨 program 共享）
                     if tool_name not in self._continuum_global_tool_durations:
                         self._continuum_global_tool_durations[tool_name] = deque(maxlen=1024)
-                    self._continuum_global_tool_durations[tool_name].append(idle_gap)
+                    self._continuum_global_tool_durations[tool_name].append(recorded_duration)
 
             # Use per-tool CDF if available (Continuum paper's approach)
             # 优先级：全局工具历史 > 程序工具历史 > 全局 idle gap > 程序 idle gap > default

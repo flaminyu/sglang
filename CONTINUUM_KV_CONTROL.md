@@ -1,17 +1,36 @@
-# Continuum KV TTL 控制（基于论文实现）
+# DTTL (Dynamic TTL) - Continuum KV Cache 控制实现
 
-该文档对应当前项目内的 `KVBlocking/sglang_continuum`。这是对 [Continuum 论文](https://arxiv.org/abs/2511.02230) 的实现。
+该文档对应当前项目内的 `KVBlocking/sglang_continuum`。这是对 [Continuum 论文](https://arxiv.org/abs/2511.02230) 的 **Dynamic TTL (DTTL)** 实现。
 
 **重要说明**：`continuum_apply_policy_to_request()` 函数已在以下位置被调用：
-- `tokenizer_manager.py` 第 1039 行（通过 `server_args.continuum_ttl_sec` 触发）
+- `tokenizer_manager.py` 第 1039 行（通过 `schedule_policy=continuum` 触发）
 - `serving_base.py` 第 321 行（通过 `continuum_ttl_sec` 参数触发）
+
+**核心要点**：DTTL 不是静态 TTL！它是一个**动态计算**的机制，根据历史工具执行时间来自动确定最优的缓存保留时间。
 
 ## 1) 启动服务
 
+**方式一：使用环境变量（推荐）**
+
 ```bash
-cd /data/home/sczd795/run/KVbloking
+# 设置项目根目录
+export SGLANG_PROJECT_ROOT="$(pwd)"
 
 # 启动 sglang 服务
+python -m sglang.launch_server ...
+```
+
+**方式二：使用 .env 文件**
+
+```bash
+source .env
+python -m sglang.launch_server ...
+```
+
+**方式三：直接指定**
+
+```bash
+cd $SGLANG_PROJECT_ROOT  # 或 cd 到项目根目录
 python -m sglang.launch_server ...
 ```
 
@@ -27,12 +46,14 @@ Continuum 论文提出的核心问题是：**多轮 Agent 工作负载中的 KV 
 1. **Prefill/Reload 开销**：下次请求需要重新计算 KV
 2. **Per-turn 排队延迟**：即使启用了 CPU 卸载，后续请求也需要等待 GPU 内存
 
-### TTL 机制
+### DTTL 机制
 
-Continuum 引入了 **Time-To-Live (TTL)** 机制：
+Continuum 引入了 **Dynamic TTL (DTTL)** 机制：
 
 ```
 请求完成（带 tool call）
+    ↓
+记录工具执行时间到历史
     ↓
 计算最优 TTL：τ* = argmax_τ P(τ,f) × (T·η + Prefill-Reload) - (MemUsage/M) × τ
     ↓
@@ -55,6 +76,37 @@ Continuum 引入了 **Time-To-Live (TTL)** 机制：
 - **η** = 记忆因子 = -Corr(k, N-k)
 - **Prefill-Reload** = 重载 KV 的时间开销
 - **MemUsage/M** = 相对内存占用
+
+### TTL 动态计算流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   TTL 动态计算流程                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. 记录工具执行时间                                             │
+│     • 每个 program 维护自己的工具执行历史                         │
+│     • 全局维护跨 program 的工具执行历史                          │
+│                                                                  │
+│  2. 构建 CDF（累积分布函数）                                     │
+│     • Per-tool CDF: 特定工具的历史分布                          │
+│     • Per-program CDF: 该程序的历史分布                         │
+│     • Global CDF: 全局空闲间隔分布                              │
+│                                                                  │
+│  3. 计算最优 TTL                                                │
+│     • 收益 = P(τ,f) × (排队延迟 + 重载收益)                    │
+│     • 成本 = 内存占用 × τ                                      │
+│     • τ* = 最大化 (收益 - 成本)                                │
+│                                                                  │
+│  4. TTL 优先级选择                                              │
+│     1. 全局工具历史 (global_tool_cdf)                          │
+│     2. 程序工具历史 (tool_cdf)                                  │
+│     3. 全局空闲间隔 (global_cdf)                               │
+│     4. 程序空闲间隔 (program_cdf)                               │
+│     5. 默认 TTL (default_fallback)                              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ## 3) 配置参数（环境变量）
 

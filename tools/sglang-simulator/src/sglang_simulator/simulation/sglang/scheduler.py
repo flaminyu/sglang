@@ -29,6 +29,60 @@ from sglang_simulator.utils.json import CustomJsonEncoder
 logger = get_logger("sgl_simulator")
 
 
+# ========== Visualization Data Collection Helpers ==========
+
+def _extract_program_id(req) -> tuple[str, int]:
+    """从请求中提取 program_id 和 turn_index"""
+    try:
+        sampling_params = getattr(req, 'sampling_params', None)
+        custom_params = getattr(sampling_params, 'custom_params', None) or {}
+        sim_params = custom_params.get("simulation", {}) if isinstance(custom_params, dict) else {}
+        program_id = sim_params.get("program_id", f"req_{req.rid[:8]}")
+        turn_index = sim_params.get("turn_index", 0)
+    except (AttributeError, TypeError):
+        # 处理 None 或无效的 sampling_params
+        program_id = f"req_{req.rid[:8]}"
+        turn_index = 0
+    return program_id, turn_index
+
+
+def _get_cache_state_snapshot(gpu) -> dict:
+    """获取 GPU 缓存状态快照"""
+    # L0 (GPU) 缓存条目
+    l0_entries = []
+    if hasattr(gpu, 'radix_cache'):
+        cache = gpu.radix_cache
+        if hasattr(cache, 'cache'):
+            for key, node in cache.cache.items():
+                if node and node.kv_cache:
+                    tokens = getattr(node, 'used_tokens', 0)
+                    pinned = getattr(node, 'is_pinned', False)
+                    if tokens > 0:
+                        l0_entries.append({
+                            "key": str(key),
+                            "tokens": tokens,
+                            "pinned": pinned,
+                        })
+
+    # L1 (Host) 缓存条目（如果有）
+    l1_entries = []
+    if hasattr(gpu, 'hicache') and gpu.hicache:
+        storage = gpu.hicache
+        if hasattr(storage, 'host_storage') and storage.host_storage:
+            for key, data in storage.host_storage.items():
+                tokens = getattr(data, 'size', 0) if data else 0
+                if tokens > 0:
+                    l1_entries.append({
+                        "key": str(key),
+                        "tokens": tokens,
+                    })
+
+    return {
+        "l0_entries": l0_entries,
+        "l1_entries": l1_entries,
+    }
+
+
 class C_SchedulerHook(BaseHook):
     HOOK_CLASS_NAME = "Scheduler"
     HOOK_MODULE_NAME = "sglang.srt.managers.scheduler"
@@ -48,6 +102,150 @@ class C_SchedulerHook(BaseHook):
     FUTURE_QUEUE: list[tuple[float, int, RequestStats]] = (
         []
     )  # tuple(created time, salt, request)
+
+    # ========== Visualization Data Collection ==========
+    # 每个时间步的完整缓存状态快照
+    CACHE_SNAPSHOTS: list[dict] = []
+    # 每个事件的详细命中信息
+    EVENT_RECORDS: list[dict] = []
+    # 程序元信息
+    PROGRAM_META: dict[str, dict] = {}
+    # 缓存配置
+    CACHE_CONFIG: dict = {
+        "max_tokens": 0,
+        "max_host_tokens": 0,
+        "l1_bandwidth_gb": 50.0,
+        "l2_bandwidth_gb": 5.0,
+    }
+
+    @classmethod
+    def _init_visualization_data(cls):
+        """初始化可视化数据收集器"""
+        cls.CACHE_SNAPSHOTS.clear()
+        cls.EVENT_RECORDS.clear()
+        cls.PROGRAM_META.clear()
+        cls.CACHE_CONFIG = {
+            "max_tokens": 0,
+            "max_host_tokens": 0,
+            "l1_bandwidth_gb": 50.0,
+            "l2_bandwidth_gb": 5.0,
+        }
+
+    @classmethod
+    def _init_cache_config(cls, server_args):
+        """从服务器参数初始化缓存配置"""
+        # 从 scheduler_config 获取 max_tokens
+        sched_config = ConfigManager.get_scheduler_config()
+        if sched_config:
+            cls.CACHE_CONFIG["max_tokens"] = getattr(
+                sched_config, "max_total_num_tokens", 100000
+            )
+            cls.CACHE_CONFIG["max_host_tokens"] = getattr(
+                sched_config, "max_total_num_tokens", 100000
+            ) * 10  # Host 通常是 GPU 的 10 倍
+
+    @classmethod
+    def record_cache_snapshot(cls, current_time: float, gpu_states: list):
+        """记录当前时间步的缓存状态快照"""
+        if not gpu_states:
+            return
+
+        # 汇总所有 GPU 的缓存状态
+        total_l0_tokens = 0
+        total_l1_tokens = 0
+        l0_entries = []
+        l1_entries = []
+
+        for gpu in gpu_states:
+            # 统计 L0 缓存
+            if hasattr(gpu, 'radix_cache'):
+                cache = gpu.radix_cache
+                if hasattr(cache, 'used_tokens'):
+                    total_l0_tokens += cache.used_tokens
+
+            # 收集 L0 条目信息
+            if hasattr(gpu, 'running_batch') and gpu.running_batch:
+                for req in gpu.running_batch.reqs:
+                    tokens = getattr(req, 'cached_tokens', 0)
+                    if tokens > 0:
+                        program_id, turn_index = _extract_program_id(req)
+                        pinned = getattr(req, 'is_pinned', False)
+                        l0_entries.append({
+                            "program_id": program_id,
+                            "turn": turn_index,
+                            "tokens": tokens,
+                            "pinned": pinned,
+                        })
+
+            # 统计 L1 缓存
+            if hasattr(gpu, 'hicache') and gpu.hicache:
+                storage = gpu.hicache
+                if hasattr(storage, 'host_tokens'):
+                    total_l1_tokens += storage.host_tokens
+
+        snapshot = {
+            "time": current_time,
+            "l0_tokens": total_l0_tokens,
+            "l1_tokens": total_l1_tokens,
+            "l0_entries": l0_entries,
+            "l1_entries": l1_entries,
+            "running_count": sum(len(gpu.running_batch.reqs) if hasattr(gpu, 'running_batch') else 0 for gpu in gpu_states),
+            "pending_count": sum(len(gpu.waiting_queue) if hasattr(gpu, 'waiting_queue') else 0 for gpu in gpu_states),
+        }
+        cls.CACHE_SNAPSHOTS.append(snapshot)
+
+    @classmethod
+    def record_event(cls, event_data: dict):
+        """记录一个事件"""
+        cls.EVENT_RECORDS.append(event_data)
+
+    @classmethod
+    def get_visualization_data(cls) -> dict:
+        """获取完整的可视化数据"""
+        # 统计汇总
+        total_events = len(cls.EVENT_RECORDS)
+        l0_hits = sum(1 for e in cls.EVENT_RECORDS if e.get("hit_type") == "L0")
+        l1_hits = sum(1 for e in cls.EVENT_RECORDS if e.get("hit_type") == "L1")
+        misses = sum(1 for e in cls.EVENT_RECORDS if e.get("hit_type") == "Miss")
+        pinned = sum(1 for e in cls.EVENT_RECORDS if e.get("was_pinned", False))
+        evicted = sum(e.get("evicted_tokens", 0) for e in cls.EVENT_RECORDS)
+
+        total_time = 0
+        if cls.CACHE_SNAPSHOTS:
+            total_time = cls.CACHE_SNAPSHOTS[-1].get("time", 0)
+
+        return {
+            "config": cls.CACHE_CONFIG,
+            "events": cls.EVENT_RECORDS,
+            "cache_snapshots": cls.CACHE_SNAPSHOTS,
+            "program_meta": cls.PROGRAM_META,
+            "summary": {
+                "total_events": total_events,
+                "total_time": total_time,
+                "l0_hits": l0_hits,
+                "l1_hits": l1_hits,
+                "misses": misses,
+                "pinned_count": pinned,
+                "evicted_tokens": evicted,
+                "l0_hit_rate": l0_hits / max(1, total_events),
+                "l1_hit_rate": l1_hits / max(1, total_events),
+                "overall_hit_rate": (l0_hits + l1_hits) / max(1, total_events),
+            },
+            "stats": {
+                "l0_hits": l0_hits,
+                "l1_hits": l1_hits,
+                "misses": misses,
+                "evicted": evicted,
+                "hit_rate": (l0_hits + l1_hits) / max(1, total_events),
+            },
+        }
+
+    @classmethod
+    def reset_visualization_data(cls):
+        """重置可视化数据"""
+        cls.CACHE_SNAPSHOTS.clear()
+        cls.EVENT_RECORDS.clear()
+        cls.PROGRAM_META.clear()
 
     @classmethod
     def hook(cls, target):
@@ -80,6 +278,10 @@ class C_SchedulerHook(BaseHook):
             # Note: TTL Continuum Pinning (init_continuum_pin) is already called
             # by the original __init__ method in scheduler.py.
             # The simulator preserves all TTL-related functionality.
+
+            # ========== Initialize Visualization Data Collection ==========
+            C_SchedulerHook._init_visualization_data()
+            C_SchedulerHook._init_cache_config(server_args)
 
             try:
                 if ConfigManager.get_model_info() is None:
@@ -157,9 +359,11 @@ class C_SchedulerHook(BaseHook):
 
                     if len(C_SchedulerHook.FUTURE_QUEUE) != 0:
                         _, _, gen_req = C_SchedulerHook.FUTURE_QUEUE[-1]
-                        total_request = gen_req.sampling_params.custom_params[
-                            "simulation"
-                        ]["total_request"]
+                        # 安全获取 total_request
+                        sampling_params = getattr(gen_req, 'sampling_params', None)
+                        custom_params = getattr(sampling_params, 'custom_params', None) if sampling_params else None
+                        simulation = (custom_params or {}).get("simulation") if custom_params else None
+                        total_request = (simulation or {}).get("total_request", 1) if simulation else 1
 
                         if len(C_SchedulerHook.FUTURE_QUEUE) == total_request:
                             C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = True
@@ -200,8 +404,20 @@ class C_SchedulerHook(BaseHook):
                     req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
                     req_stats.rid = req.rid
                     req_stats.input_length = len(req.input_ids)
-                    req_stats.output_length = req.sampling_params.max_new_tokens
-                    simulation_args = req.sampling_params.custom_params["simulation"]
+
+                    # 安全获取 max_new_tokens
+                    sampling_params = getattr(req, 'sampling_params', None)
+                    if sampling_params:
+                        req_stats.output_length = getattr(sampling_params, 'max_new_tokens', 0) or 0
+                        custom_params = getattr(sampling_params, 'custom_params', None)
+                        simulation_args = (custom_params or {}).get("simulation") if custom_params else None
+                    else:
+                        req_stats.output_length = 0
+                        simulation_args = None
+
+                    if simulation_args is None:
+                        # 跳过非模拟请求
+                        continue
                     if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
                         if "server_created_time" not in simulation_args:
                             logger.warning(
@@ -366,6 +582,75 @@ class C_SchedulerHook(BaseHook):
                         "l2_backup_latency": hicache_l2_backup_dur,
                     }
                 )
+
+                # ========== Visualization Data Collection ==========
+                # 获取所有 GPU 状态
+                gpu_states = getattr(self, 'gpu_states', [self])
+                current_time = StateManager.get_global_clock()
+
+                # 记录缓存快照
+                C_SchedulerHook.record_cache_snapshot(current_time, gpu_states)
+
+                # 为每个请求记录事件
+                for req in batch.reqs:
+                    if req.is_chunked == 0:
+                        program_id, turn_index = _extract_program_id(req)
+                        req_stats = C_SchedulerHook.REQUEST_STATS.get(req.rid)
+
+                        # 判断缓存命中类型
+                        hit_type = "Miss"
+                        hit_tokens = 0
+                        miss_tokens = req_stats.input_length if req_stats else 0
+                        was_pinned = getattr(req, 'is_pinned', False)
+
+                        if hasattr(req, 'cached_tokens') and req.cached_tokens > 0:
+                            hit_type = "L0"
+                            hit_tokens = req.cached_tokens
+                            miss_tokens = max(0, (req_stats.input_length if req_stats else 0) - hit_tokens)
+
+                        # 记录程序元信息
+                        if program_id not in C_SchedulerHook.PROGRAM_META:
+                            simulation_args = getattr(req, 'sampling_params', None)
+                            simulation_args = (getattr(simulation_args, 'custom_params', None) or {}).get("simulation", {}) if simulation_args else {}
+                            if isinstance(simulation_args, dict):
+                                C_SchedulerHook.PROGRAM_META[program_id] = {
+                                    "program_id": program_id,
+                                    "is_tool_call": simulation_args.get("is_tool_call", False),
+                                    "tool_name": simulation_args.get("tool_name"),
+                                }
+                            else:
+                                simulation_args = {}
+                                C_SchedulerHook.PROGRAM_META[program_id] = {
+                                    "program_id": program_id,
+                                    "is_tool_call": False,
+                                    "tool_name": None,
+                                }
+
+                        # 获取 simulation_args 用于事件记录
+                        if program_id in C_SchedulerHook.PROGRAM_META:
+                            meta = C_SchedulerHook.PROGRAM_META[program_id]
+                            is_tool_call = meta.get("is_tool_call", False)
+                            tool_name = meta.get("tool_name")
+                        else:
+                            is_tool_call = False
+                            tool_name = None
+
+                        # 记录事件
+                        event = {
+                            "time": current_time,
+                            "program_id": program_id,
+                            "turn_index": turn_index,
+                            "input_tokens": req_stats.input_length if req_stats else 0,
+                            "output_tokens": req_stats.output_length if req_stats else 0,
+                            "hit_type": hit_type,
+                            "hit_tokens": hit_tokens,
+                            "miss_tokens": miss_tokens,
+                            "was_pinned": was_pinned,
+                            "evicted_tokens": 0,  # 需要从缓存淘汰逻辑获取
+                            "is_tool_call": is_tool_call,
+                            "tool_name": tool_name,
+                        }
+                        C_SchedulerHook.record_event(event)
             C_SchedulerHook.LAST_CPU_TS = time.time()
             return ret
 
@@ -410,6 +695,24 @@ class C_SchedulerHook(BaseHook):
                         for item in stats:
                             f.write(json.dumps(asdict(item)) + "\n")
 
+                    # ========== Export Visualization Data ==========
+                    viz_data = C_SchedulerHook.get_visualization_data()
+                    # 对齐时间戳
+                    if viz_data["events"]:
+                        min_time = min(e["time"] for e in viz_data["events"])
+                        for event in viz_data["events"]:
+                            event["time"] -= min_time
+                    if viz_data["cache_snapshots"]:
+                        min_time = min(s["time"] for s in viz_data["cache_snapshots"])
+                        for snapshot in viz_data["cache_snapshots"]:
+                            snapshot["time"] -= min_time
+                    viz_data["summary"]["total_time"] = max(
+                        (e["time"] for e in viz_data["events"]), default=0
+                    )
+
+                    with open(f"{output_dir}/visualization_data.json", "w") as f:
+                        f.write(json.dumps(viz_data, cls=CustomJsonEncoder, indent=2))
+
                     logger.info(f"Simulation results saved to {output_dir}.")
 
                 except Exception as e:
@@ -420,6 +723,7 @@ class C_SchedulerHook(BaseHook):
             StateManager.reset()
             C_SchedulerHook.REQUEST_STATS.clear()
             C_SchedulerHook.ITERATION_STATS.clear()
+            C_SchedulerHook.reset_visualization_data()  # Reset visualization data
             C_SchedulerHook.LAST_CPU_TS = 0
             C_SchedulerHook.LAST_FLUSH_TS = time.time()
             C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = False

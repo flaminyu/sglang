@@ -83,13 +83,77 @@ class MockSGLKernel:
         self.load_utils = MockLoadUtils()
     
     def __getattr__(self, name):
-        # Return mock functions for any attribute access
+        # Return mock for known submodules
+        if name == 'scalar_type':
+            return self._create_scalar_type_mock()
+        if name == 'kvcacheio':
+            return self._create_kvcacheio_mock()
+        if name == 'allreduce':
+            return self._create_allreduce_mock()
+        if name == 'load_utils':
+            return self.load_utils
+        if name == 'common_ops':
+            return self.common_ops
         return lambda *args, **kwargs: None
+    
+    def _create_allreduce_mock(self):
+        """Create a mock allreduce module."""
+        class MockAllreduce:
+            def __getattr__(self, name):
+                return lambda *args, **kwargs: None
+        return MockAllreduce()
+    
+    def _create_kvcacheio_mock(self):
+        """Create a mock kvcacheio module."""
+        class MockKVCacheIO:
+            def __getattr__(self, name):
+                return lambda *args, **kwargs: None
+        return MockKVCacheIO()
+    
+    def _create_scalar_type_mock(self):
+        """Create a mock scalar_type module with required exports."""
+        class MockScalarType:
+            """Mock ScalarType class."""
+            def __init__(self, name="mock", size_bytes=2):
+                self.name = name
+                self.size_bytes = size_bytes
+                self.block_size = 16
+                self.is_integer = True
+                self.is_float = False
+                self.is_signed = True
+        
+        # Create mock scalar_types with required attributes
+        class MockScalarTypes:
+            uint4b8 = "uint4b8"
+            uint8b128 = "uint8b128"
+            int8 = MockScalarType("int8", 1)
+            float8_e4m3fn = MockScalarType("float8_e4m3fn", 1)
+            
+            def __getattr__(self, name):
+                # Return a default mock type for any unknown attribute
+                return MockScalarType(name)
+            
+            def __iter__(self):
+                return iter([self.int8, self.float8_e4m3fn])
+            
+            def __len__(self):
+                return 2
+            
+            def __getitem__(self, i):
+                return [self.int8, self.float8_e4m3fn][i]
+        
+        mock_scalar_type = MockScalarType()
+        mock_scalar_type.ScalarType = MockScalarType
+        mock_scalar_type.scalar_types = MockScalarTypes()
+        return mock_scalar_type
 
 # Install mock sgl_kernel in sys.modules
 mock_sgl_kernel = MockSGLKernel()
 sys.modules['sgl_kernel'] = mock_sgl_kernel
 sys.modules['sgl_kernel.load_utils'] = mock_sgl_kernel.load_utils
+sys.modules['sgl_kernel.scalar_type'] = mock_sgl_kernel._create_scalar_type_mock()
+sys.modules['sgl_kernel.kvcacheio'] = mock_sgl_kernel._create_kvcacheio_mock()
+sys.modules['sgl_kernel.allreduce'] = mock_sgl_kernel._create_allreduce_mock()
 
 print("[CPU Simulator] Mock sgl_kernel installed")
 
@@ -179,6 +243,12 @@ if __name__ == "__main__":
 
     if simulation_args.sim_config_path:
         os.environ["SGLANG_SIMULATOR_CONFIG_PATH"] = simulation_args.sim_config_path
+
+    # Ensure served_model_name is set before calling check_server_args()
+    # This is a workaround for a bug where check_server_args() doesn't call
+    # _handle_missing_default_values() first
+    if server_args.served_model_name is None:
+        server_args.served_model_name = server_args.model_path
 
     logger.info(f"Launching SGLang Simulator (CPU Mode)")
     logger.info(f"Model: {server_args.model_path}")

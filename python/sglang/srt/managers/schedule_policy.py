@@ -110,6 +110,8 @@ class ContinuumRequestQueue:
     def __init__(self):
         # job_id (or session_id as fallback) → first entry time
         self.job_id_first_entry_time: dict[str, float] = {}
+        # job_id → latest turn_index seen for this job (for turn continuity)
+        self.job_id_latest_turn: dict[str, int] = {}
 
     def _get_affinity_key(self, req) -> str:
         """Return job_id if set, else session_id, else a unique placeholder."""
@@ -138,34 +140,71 @@ class ContinuumRequestQueue:
         """
         Return the best request to schedule next, without removing it.
 
-        Priority:
-        1. Requests whose job_id matches a pinned request (can reuse cached KV).
-        2. Among unpinned, pick the one whose job arrived earliest.
+        Priority (Enhanced for turn continuity):
+        1. Pinned requests from same job_id (can reuse cached KV).
+           Among these, prefer requests with continuous turn_index.
+        2. Unpinned requests from same job_id (keep same job's turns together).
+           Among these, prefer continuous turn_index.
+        3. Other requests (job-level FCFS).
         """
         pinned_job_ids = {
             self._get_affinity_key(r) for r in pinned_requests
         }
-
-        pinned_candidates = []
-        unpinned_candidates = []
-
+        
+        # Group requests by job_id
+        job_groups: dict[str, list] = {}
         for req in waiting_queue:
             key = self._get_affinity_key(req)
-            entry_time = self.get_first_entry_time(req)
-            if key in pinned_job_ids:
-                pinned_candidates.append((entry_time, req))
-            else:
-                unpinned_candidates.append((entry_time, req))
+            if key not in job_groups:
+                job_groups[key] = []
+            job_groups[key].append(req)
 
-        # Prefer pinned: pick earliest entry
+        pinned_candidates = []  # (job_id, turn_index, entry_time, req)
+        same_job_candidates = []  # unpinned but same job as pinned
+        other_candidates = []  # (entry_time, req)
+
+        for key, reqs in job_groups.items():
+            # Get entry time for this job
+            entry_time = self.get_first_entry_time(reqs[0])
+            
+            # Get turn index if available
+            turn_index = getattr(reqs[0], 'turn_index', None) or 0
+            
+            is_pinned = key in pinned_job_ids
+            
+            for req in reqs:
+                req_turn = getattr(req, 'turn_index', None) or 0
+                if is_pinned:
+                    # Check if this is a continuous turn (next turn after last pinned)
+                    last_turn = self.job_id_latest_turn.get(key, req_turn - 1)
+                    is_continuous = (req_turn == last_turn + 1) or (req_turn == last_turn)
+                    pinned_candidates.append((key, req_turn, entry_time, is_continuous, req))
+                else:
+                    other_candidates.append((entry_time, req))
+            
+            # Check if any other jobs have pinned requests for this job
+            if not is_pinned:
+                for pinned_req in pinned_requests:
+                    pinned_key = self._get_affinity_key(pinned_req)
+                    if pinned_key == key:
+                        same_job_candidates.append((entry_time, reqs[0]))
+                        break
+
+        # 1. First priority: pinned with continuous turn_index
         if pinned_candidates:
-            pinned_candidates.sort(key=lambda x: x[0])
-            return pinned_candidates[0][1]
+            # Sort by: continuous first, then by job_id entry time, then by turn_index
+            pinned_candidates.sort(key=lambda x: (not x[3], x[2], x[1]))
+            return pinned_candidates[0][4]
 
-        # Fall back to earliest entry time
-        if unpinned_candidates:
-            unpinned_candidates.sort(key=lambda x: x[0])
-            return unpinned_candidates[0][1]
+        # 2. Second priority: same job as pinned (even if not pinned itself)
+        if same_job_candidates:
+            same_job_candidates.sort(key=lambda x: x[0])
+            return same_job_candidates[0][1]
+
+        # 3. Fall back to job-level FCFS
+        if other_candidates:
+            other_candidates.sort(key=lambda x: x[0])
+            return other_candidates[0][1]
 
         return None  # empty queue
 
@@ -176,12 +215,49 @@ class ContinuumRequestQueue:
     ) -> None:
         """
         Reorder waiting_queue in-place: pinned jobs first, then by job entry time.
+        
+        Enhanced for turn continuity:
+        - Groups requests by job_id
+        - Pins requests with continuous turn_index are moved to front
+        - Same job's requests are kept together
+        
         This is called by SchedulePolicy.calc_priority when policy=continuum.
         """
-        best = self.peek_best_request(waiting_queue, pinned_requests)
-        if best and waiting_queue and best is not waiting_queue[0]:
-            waiting_queue.remove(best)
-            waiting_queue.insert(0, best)
+        if not waiting_queue:
+            return
+            
+        # Group requests by job_id
+        pinned_job_ids = {self._get_affinity_key(r) for r in pinned_requests}
+        
+        pinned_reqs = []
+        same_job_reqs = []
+        other_reqs = []
+        
+        for req in waiting_queue:
+            key = self._get_affinity_key(req)
+            entry_time = self.get_first_entry_time(req)
+            turn_index = getattr(req, 'turn_index', None) or 0
+            
+            if key in pinned_job_ids:
+                pinned_reqs.append((entry_time, turn_index, req))
+            elif any(self._get_affinity_key(pr) == key for pr in pinned_requests):
+                same_job_reqs.append((entry_time, turn_index, req))
+            else:
+                other_reqs.append((entry_time, turn_index, req))
+        
+        # Sort each group
+        pinned_reqs.sort(key=lambda x: (x[0], x[1]))  # by entry time, then turn
+        same_job_reqs.sort(key=lambda x: (x[0], x[1]))
+        other_reqs.sort(key=lambda x: (x[0], x[1]))
+        
+        # Rebuild queue: pinned first, then same job, then others
+        new_queue = [r for _, _, r in pinned_reqs]
+        new_queue.extend([r for _, _, r in same_job_reqs])
+        new_queue.extend([r for _, _, r in other_reqs])
+        
+        # Update in-place
+        waiting_queue.clear()
+        waiting_queue.extend(new_queue)
 
 
 class SchedulePolicy:

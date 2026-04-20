@@ -9,22 +9,31 @@
 #SBATCH --gpus=1
 #SBATCH --time=01:00:00
 #SBATCH --partition=gpu
-#SBATCH --output=/data/home/sczd795/logs/simulator/%x_%j.out
-#SBATCH --error=/data/home/sczd795/logs/simulator/%x_%j.err
+#SBATCH --output=${SLURM_LOG_DIR:-/tmp/slurm}/%x_%j.out
+#SBATCH --error=${SLURM_LOG_DIR:-/tmp/slurm}/%x_%j.err
 
-PROJECT_DIR="/data/home/sczd795/run/KVbloking/sglang_continuum"
-LOG_DIR="/data/home/sczd795/logs/simulator"
-mkdir -p "$LOG_DIR"
+# 自动检测项目根目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="${SGLANG_PROJECT_ROOT:-$SCRIPT_DIR}"
+LOG_DIR="${SGLANG_LOG_DIR:-${PROJECT_DIR}/logs}"
+
+mkdir -p "$LOG_DIR" "$PROJECT_DIR"
 cd "$PROJECT_DIR"
 
-export PYTHONPATH="${PROJECT_DIR}/tools/sglang-simulator/src:${PROJECT_DIR}/python"
+export PYTHONPATH="${PROJECT_DIR}/tools/sglang-simulator/src:${PROJECT_DIR}/python:${PYTHONPATH:-}"
 
 echo "==================================================================="
 echo "SGLang Simulator + TTL Test $(date)"
 echo "==================================================================="
+echo "Project: $PROJECT_DIR"
+echo "Python Path: ${PYTHONPATH:0:80}..."
 
-source /data/apps/miniforge3/etc/profile.d/conda.sh
-conda activate kvbloking
+# 检测 conda 环境
+if [ -n "$CONDA_DEFAULT_ENV" ]; then
+    echo "Conda Environment: $CONDA_DEFAULT_ENV"
+else
+    echo "[INFO] No conda environment detected, using system Python"
+fi
 
 echo ""
 echo "[1] 检查环境..."
