@@ -270,3 +270,7 @@ sgl-kernel/csrc/**/*_musa/
 
 # MUSA core dump files
 *.mudmp
+
+# SGLang Simulator - generated results and configs
+tools/sglang-simulator/results/
+tools/sglang-simulator/configs/

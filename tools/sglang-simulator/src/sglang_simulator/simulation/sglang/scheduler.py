@@ -103,6 +103,18 @@ class C_SchedulerHook(BaseHook):
         []
     )  # tuple(created time, salt, request)
 
+    # ========== Continuum TTL Integration ==========
+    TTL_SIMULATOR = None  # ContinuumTTLSimulator instance
+    TTL_ENABLED = False
+    PINNED_PROGRAMS: dict[str, float] = {}  # program_id -> expires_at
+    TTL_CONFIG: dict = {
+        "default_ttl": 3.0,
+        "min_ttl": 0.1,
+        "max_ttl": 10.0,
+        "history_threshold": 10,
+        "memory_pressure_penalty": 0.5,
+    }
+
     # ========== Visualization Data Collection ==========
     # 每个时间步的完整缓存状态快照
     CACHE_SNAPSHOTS: list[dict] = []
@@ -143,6 +155,100 @@ class C_SchedulerHook(BaseHook):
             cls.CACHE_CONFIG["max_host_tokens"] = getattr(
                 sched_config, "max_total_num_tokens", 100000
             ) * 10  # Host 通常是 GPU 的 10 倍
+
+    @classmethod
+    def _init_ttl_simulator(cls, server_args):
+        """Initialize Continuum TTL Simulator from config"""
+        from sglang_simulator.simulation.agent.continuum_ttl import ContinuumTTLSimulator
+
+        # Load TTL config from environment or use defaults
+        ttl_default = float(os.getenv("CONTINUUM_TTL_DEFAULT", "3.0"))
+        ttl_min = float(os.getenv("CONTINUUM_TTL_MIN", "0.1"))
+        ttl_max = float(os.getenv("CONTINUUM_TTL_MAX", "10.0"))
+        ttl_history = int(os.getenv("CONTINUUM_TTL_HISTORY", "10"))
+        ttl_penalty = float(os.getenv("CONTINUUM_TTL_PENALTY", "0.5"))
+        cls.TTL_ENABLED = os.getenv("CONTINUUM_TTL_ENABLED", "false").lower() == "true"
+
+        cls.TTL_CONFIG = {
+            "default_ttl": ttl_default,
+            "min_ttl": ttl_min,
+            "max_ttl": ttl_max,
+            "history_threshold": ttl_history,
+            "memory_pressure_penalty": ttl_penalty,
+        }
+
+        if cls.TTL_ENABLED:
+            cls.TTL_SIMULATOR = ContinuumTTLSimulator(
+                default_ttl=ttl_default,
+                min_ttl=ttl_min,
+                max_ttl=ttl_max,
+                history_threshold=ttl_history,
+                memory_pressure_penalty=ttl_penalty,
+                enable_adaptive_ttl=True,
+            )
+            logger.info(f"[Continuum TTL] Simulator enabled with config: {cls.TTL_CONFIG}")
+        else:
+            cls.TTL_SIMULATOR = None
+            logger.info("[Continuum TTL] Simulator disabled (baseline mode)")
+
+    @classmethod
+    def _record_tool_execution(cls, program_id: str, tool_name: str, duration: float, idle_gap: float = 0):
+        """Record tool execution for TTL calculation"""
+        if cls.TTL_SIMULATOR is not None:
+            cls.TTL_SIMULATOR.record_tool_execution(program_id, tool_name, duration, idle_gap)
+
+    @classmethod
+    def _select_ttl(cls, program_id: str, tool_name: str = None, queue_time: float = 0) -> tuple[float, str]:
+        """Select dynamic TTL for a program"""
+        if cls.TTL_SIMULATOR is not None:
+            return cls.TTL_SIMULATOR.select_dynamic_ttl(program_id, tool_name, queue_time)
+        return cls.TTL_CONFIG["default_ttl"], "default"
+
+    @classmethod
+    def _expire_pins(cls, current_time: float):
+        """Expire old PINs and return expired program IDs"""
+        expired = []
+        for pid, expires_at in list(cls.PINNED_PROGRAMS.items()):
+            if current_time > expires_at:
+                expired.append(pid)
+                del cls.PINNED_PROGRAMS[pid]
+        return expired
+
+    @classmethod
+    def _is_pinned(cls, program_id: str, current_time: float) -> bool:
+        """Check if a program is currently pinned"""
+        if program_id not in cls.PINNED_PROGRAMS:
+            return False
+        return current_time <= cls.PINNED_PROGRAMS[program_id]
+
+    @classmethod
+    def _pin_program(cls, program_id: str, ttl_sec: float, current_time: float):
+        """Pin a program for the specified TTL"""
+        cls.PINNED_PROGRAMS[program_id] = current_time + ttl_sec
+
+    @classmethod
+    def _get_priority(cls, program_id: str, arrival_time: float, current_time: float) -> tuple:
+        """Get scheduling priority: PIN programs > FCFS"""
+        if cls._is_pinned(program_id, current_time):
+            return (0, arrival_time)  # PIN programs get highest priority
+        return (1, arrival_time)  # FCFS for others
+
+    @classmethod
+    def get_ttl_stats(cls) -> dict:
+        """Get TTL statistics"""
+        if cls.TTL_SIMULATOR is not None:
+            stats = cls.TTL_SIMULATOR.get_stats()
+            return {
+                **stats,
+                "ttl_enabled": cls.TTL_ENABLED,
+                "active_pins": len(cls.PINNED_PROGRAMS),
+                "ttl_config": cls.TTL_CONFIG,
+            }
+        return {
+            "ttl_enabled": False,
+            "active_pins": len(cls.PINNED_PROGRAMS),
+            "ttl_config": cls.TTL_CONFIG,
+        }
 
     @classmethod
     def record_cache_snapshot(cls, current_time: float, gpu_states: list):
@@ -210,12 +316,22 @@ class C_SchedulerHook(BaseHook):
         pinned = sum(1 for e in cls.EVENT_RECORDS if e.get("was_pinned", False))
         evicted = sum(e.get("evicted_tokens", 0) for e in cls.EVENT_RECORDS)
 
+        # Time breakdown statistics
+        total_prefill_time = sum(e.get("prefill_time", 0) for e in cls.EVENT_RECORDS)
+        total_decode_time = sum(e.get("decode_time", 0) for e in cls.EVENT_RECORDS)
+        total_tool_time = sum(e.get("tool_time", 0) for e in cls.EVENT_RECORDS)
+        total_queue_time = sum(e.get("queue_time", 0) for e in cls.EVENT_RECORDS)
+
         total_time = 0
         if cls.CACHE_SNAPSHOTS:
             total_time = cls.CACHE_SNAPSHOTS[-1].get("time", 0)
 
+        # Get TTL stats
+        ttl_stats = cls.get_ttl_stats()
+
         return {
             "config": cls.CACHE_CONFIG,
+            "ttl_config": cls.TTL_CONFIG,
             "events": cls.EVENT_RECORDS,
             "cache_snapshots": cls.CACHE_SNAPSHOTS,
             "program_meta": cls.PROGRAM_META,
@@ -231,6 +347,16 @@ class C_SchedulerHook(BaseHook):
                 "l1_hit_rate": l1_hits / max(1, total_events),
                 "overall_hit_rate": (l0_hits + l1_hits) / max(1, total_events),
             },
+            "time_breakdown": {
+                "total_prefill_time": total_prefill_time,
+                "total_decode_time": total_decode_time,
+                "total_tool_time": total_tool_time,
+                "total_queue_time": total_queue_time,
+                "prefill_pct": total_prefill_time / max(1, total_time) * 100,
+                "decode_pct": total_decode_time / max(1, total_time) * 100,
+                "tool_pct": total_tool_time / max(1, total_time) * 100,
+                "queue_pct": total_queue_time / max(1, total_time) * 100,
+            },
             "stats": {
                 "l0_hits": l0_hits,
                 "l1_hits": l1_hits,
@@ -238,6 +364,7 @@ class C_SchedulerHook(BaseHook):
                 "evicted": evicted,
                 "hit_rate": (l0_hits + l1_hits) / max(1, total_events),
             },
+            "ttl_stats": ttl_stats,
         }
 
     @classmethod
@@ -246,6 +373,9 @@ class C_SchedulerHook(BaseHook):
         cls.CACHE_SNAPSHOTS.clear()
         cls.EVENT_RECORDS.clear()
         cls.PROGRAM_META.clear()
+        cls.PINNED_PROGRAMS.clear()
+        if cls.TTL_SIMULATOR:
+            cls.TTL_SIMULATOR.reset()
 
     @classmethod
     def hook(cls, target):
@@ -278,6 +408,9 @@ class C_SchedulerHook(BaseHook):
             # Note: TTL Continuum Pinning (init_continuum_pin) is already called
             # by the original __init__ method in scheduler.py.
             # The simulator preserves all TTL-related functionality.
+
+            # ========== Initialize Continuum TTL Simulator ==========
+            C_SchedulerHook._init_ttl_simulator(server_args)
 
             # ========== Initialize Visualization Data Collection ==========
             C_SchedulerHook._init_visualization_data()
@@ -635,6 +768,44 @@ class C_SchedulerHook(BaseHook):
                             is_tool_call = False
                             tool_name = None
 
+                        # Calculate time breakdown
+                        current_inference_dur = StateManager.get_current_inference_dur()
+                        hicache_l2_load_dur = StateManager.pop_hicache_l2_load_dur()
+                        hicache_l2_backup_dur = StateManager.pop_hicache_l2_backup_dur()
+
+                        # Queue time: time from last event to now
+                        queue_time = 0
+                        if req_stats:
+                            queue_time = current_time - req_stats.last_event_time
+
+                        # Prefill time vs decode time based on hit type
+                        if hit_type == "Miss" or hit_type == "L0":
+                            # Miss or L0 hit requires prefill
+                            prefill_time = current_inference_dur * 0.7  # Approximate: 70% prefill
+                            decode_time = current_inference_dur * 0.3   # 30% decode
+                        else:
+                            # L1 hit or other - mostly decode
+                            prefill_time = 0
+                            decode_time = current_inference_dur
+
+                        # Tool time (if this is a tool call, add the tool duration)
+                        tool_time = 0
+                        if is_tool_call and tool_name:
+                            # Get tool duration from simulation params
+                            tool_duration_meta = meta.get("tool_duration", 0)
+                            tool_time = tool_duration_meta
+
+                        # PIN logic for TTL
+                        ttl_sec = 0
+                        ttl_strategy = ""
+                        if is_tool_call and C_SchedulerHook.TTL_ENABLED:
+                            # Select TTL based on tool execution history
+                            ttl_sec, ttl_strategy = C_SchedulerHook._select_ttl(
+                                program_id, tool_name, queue_time
+                            )
+                            # Pin the program
+                            C_SchedulerHook._pin_program(program_id, ttl_sec, current_time)
+
                         # 记录事件
                         event = {
                             "time": current_time,
@@ -646,9 +817,19 @@ class C_SchedulerHook(BaseHook):
                             "hit_tokens": hit_tokens,
                             "miss_tokens": miss_tokens,
                             "was_pinned": was_pinned,
-                            "evicted_tokens": 0,  # 需要从缓存淘汰逻辑获取
+                            "evicted_tokens": 0,
                             "is_tool_call": is_tool_call,
                             "tool_name": tool_name,
+                            # Time breakdown
+                            "prefill_time": prefill_time,
+                            "decode_time": decode_time,
+                            "tool_time": tool_time,
+                            "queue_time": queue_time,
+                            "h2d_time": hicache_l2_load_dur,
+                            "l2_backup_time": hicache_l2_backup_dur,
+                            # TTL info
+                            "ttl_sec": ttl_sec,
+                            "ttl_strategy": ttl_strategy,
                         }
                         C_SchedulerHook.record_event(event)
             C_SchedulerHook.LAST_CPU_TS = time.time()

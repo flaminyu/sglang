@@ -14,7 +14,7 @@ from __future__ import annotations
 import random
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, TYPE_CHECKING
+from typing import List, Optional, Dict, Any, TYPE_CHECKING, Tuple
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -159,6 +159,41 @@ class AgentProgram:
                     "</invoke>")
         else:
             return THOUGHT_RESPONSES[turn_idx % len(THOUGHT_RESPONSES)]
+    
+    def compute_turn_arrival_time(
+        self,
+        turn_idx: int,
+        first_turn_arrival: float,
+        turn_inference_times: Dict[int, float],
+    ) -> float:
+        """
+        计算指定轮次的动态到达时间
+        
+        规则：
+        - Turn 0: arrival_time = first_turn_arrival (程序到达时间)
+        - Turn n: arrival_time = Turn (n-1) 完成时间 + tool_duration
+        
+        Turn (n-1) 完成时间 = Turn (n-1) 到达时间 + inference_time(n-1)
+        
+        Args:
+            turn_idx: 轮次索引
+            first_turn_arrival: Turn 0 的到达时间
+            turn_inference_times: Dict[turn_idx, inference_time] 每个轮次的推理时间
+        
+        Returns:
+            该轮次的到达时间
+        """
+        if turn_idx == 0:
+            return first_turn_arrival
+        
+        # 递归计算
+        prev_turn_inference = turn_inference_times.get(turn_idx - 1, 0.1)
+        prev_arrival = self.compute_turn_arrival_time(
+            turn_idx - 1, first_turn_arrival, turn_inference_times
+        )
+        prev_tool_duration = self.turns[turn_idx - 1].tool_duration
+        
+        return prev_arrival + prev_turn_inference + prev_tool_duration
 
 
 # ============================================================================
@@ -204,12 +239,27 @@ class MultiTurnAgentDataset(BaseDataset):
         self._build_requests()
     
     def _build_requests(self):
-        """预构建所有请求"""
+        """预构建所有请求 - 使用动态到达时间"""
         self._requests = []
         total_requests = sum(len(p.turns) for p in self.programs)
         
         for program in self.programs:
+            # 估算每个轮次的推理时间（假设完全 miss，最坏情况）
+            turn_inference_times: Dict[int, float] = {}
             for turn_idx, turn in enumerate(program.turns):
+                # 简化的推理时间估算
+                prefill_ms = turn.input_tokens * 0.1  # 0.1ms per token
+                decode_ms = turn.output_tokens * 5.0   # 5ms per token
+                turn_inference_times[turn_idx] = (prefill_ms + decode_ms) / 1000.0  # 转换为秒
+            
+            # 计算每个轮次的动态到达时间
+            program_arrival = program.arrival_time
+            for turn_idx, turn in enumerate(program.turns):
+                # 动态到达时间
+                turn_arrival = program.compute_turn_arrival_time(
+                    turn_idx, program_arrival, turn_inference_times
+                )
+                
                 # 构建输入文本
                 input_text = program.get_turn_input_text(turn_idx, self.tokenizer)
                 
@@ -227,10 +277,6 @@ class MultiTurnAgentDataset(BaseDataset):
                         max_length=getattr(self.args, 'max_input_len', 32768)
                     )['input_ids']
                 
-                # 计算到达时间（相对于程序到达）
-                # 每个程序的到达时间累加 Poisson 间隔
-                program_arrival = program.arrival_time
-                
                 # 输出文本
                 output_text = program.get_turn_output_text(turn_idx)
                 
@@ -245,9 +291,11 @@ class MultiTurnAgentDataset(BaseDataset):
                         "is_tool_call": turn.is_tool_call,
                         "tool_name": turn.tool_name,
                         "tool_duration": turn.tool_duration,
-                        "created_time": program_arrival,  # 到达时间（秒）
+                        "created_time": turn_arrival,  # 动态计算的到达时间
+                        "first_turn_arrival": program_arrival,  # 原始程序到达时间
                         "total_request": total_requests,
                         "cumulative_tokens": program.total_tokens,
+                        "estimated_inference_time": turn_inference_times[turn_idx],
                     }
                 )
                 self._requests.append(request)
@@ -379,6 +427,10 @@ class AgentDatasetConfig:
     tool_time_std: float = 0.2   # seconds
     seed: int = 42
     
+    # 推理时间估算参数
+    prefill_per_token_ms: float = 0.1  # 每个 token 的 prefill 时间 (ms)
+    decode_per_token_ms: float = 5.0    # 每个 token 的 decode 时间 (ms)
+    
     def generate_programs(self) -> List[AgentProgram]:
         """生成程序列表"""
         return MultiTurnAgentDataset.generate_programs(
@@ -393,3 +445,13 @@ class AgentDatasetConfig:
             tool_time_std=self.tool_time_std,
             seed=self.seed,
         )
+    
+    def estimate_inference_time(self, input_tokens: int, output_tokens: int) -> float:
+        """
+        估算单个请求的推理时间（秒）
+        
+        基于简单的 prefill + decode 模型
+        """
+        prefill_time_ms = input_tokens * self.prefill_per_token_ms
+        decode_time_ms = output_tokens * self.decode_per_token_ms
+        return (prefill_time_ms + decode_time_ms) / 1000.0

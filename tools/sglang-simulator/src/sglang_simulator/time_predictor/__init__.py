@@ -1,64 +1,86 @@
 """Time prediction module for sglang simulator.
 
 This module provides inference time prediction capabilities.
-The AIConfigurator predictor requires the aiconfigurator package.
-Install with: pip install aiconfigurator
 
-If aiconfigurator is not available, simulation will use a basic analytical model.
+Classes:
+- InferTimePredictor: Base class for time prediction
+- AnalyticalTimePredictor: Simple analytical model (fallback)
+- AIConfiguratorTimePredictor: Hardware-aware model using AIConfigurator library
+- ScheduleRequest: Request for scheduling
+- ScheduleBatch: Batch for scheduling
+
+Usage:
+    # Auto-detect best available predictor
+    from sglang_simulator.time_predictor import create_time_predictor
+    predictor = create_time_predictor("auto")
+
+    # Use analytical predictor explicitly
+    from sglang_simulator.time_predictor import AnalyticalTimePredictor
+    predictor = AnalyticalTimePredictor(prefill_per_token_ms=0.05, decode_per_token_ms=10.0)
+
+    # Use AIConfigurator predictor (requires aiconfigurator package)
+    from sglang_simulator.time_predictor import AIConfiguratorTimePredictor
+    predictor = AIConfiguratorTimePredictor(model, hw, config)
 """
 
 from dataclasses import dataclass
-from typing import List, TYPE_CHECKING
+from typing import List, Optional, Tuple, Dict, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sglang_simulator.simulation.types import SchedulerConfig
     from sglang_simulator.spec.model import ModelInfo
+    from sglang_simulator.spec.accelerator import AcceleratorInfo
 
 
-class InferTimePredictor:
-    """Base class for inference time prediction."""
-
-    def predict_infer_time(self, batch) -> float:
-        """Predict inference time for a batch."""
-        raise NotImplementedError()
-
-
-class ScheduleRequest:
-    """Request for scheduling."""
-
-    def __init__(self, extend_length: int = 1, past_kv_length: int = 0):
-        self.extend_length = extend_length
-        self.past_kv_length = past_kv_length
-
-
-class ScheduleBatch:
-    """Batch for scheduling."""
-
-    def __init__(self, reqs: List[ScheduleRequest] = None):
-        self.reqs = reqs or []
-
-    def is_empty(self) -> bool:
-        return len(self.reqs) == 0
-
-    def request_info(self) -> dict:
-        """Return request information for logging."""
-        return {
-            "num_requests": len(self.reqs),
-            "total_extend": sum(r.extend_length for r in self.reqs),
-        }
+# Import from aiconfigurator module
+from sglang_simulator.time_predictor.aiconfigurator import (
+    InferTimePredictor,
+    ScheduleRequest,
+    ScheduleBatch,
+    AnalyticalTimePredictor,
+    AIConfiguratorTimePredictor,
+    create_time_predictor,
+    get_perf_model,
+    is_aiconfigurator_available,
+    get_supported_hardware,
+    estimate_from_spec,
+    AI_CONFIGURATOR_AVAILABLE,
+)
 
 
-def AIConfiguratorTimePredictor(*args, **kwargs):
-    """Alias that raises an error indicating the package is not installed."""
-    raise ImportError(
-        "AIConfiguratorTimePredictor requires the aiconfigurator package. "
-        "Please install with: pip install aiconfigurator"
-    )
+def create_predictor(
+    predictor_type: str = "auto",
+    **kwargs
+) -> InferTimePredictor:
+    """
+    Create a time predictor.
+
+    Alias for create_time_predictor for convenience.
+
+    Args:
+        predictor_type: Type of predictor ("auto", "aiconfigurator", "analytical")
+        **kwargs: Arguments passed to the predictor
+
+    Returns:
+        InferTimePredictor instance
+    """
+    return create_time_predictor(predictor_type, **kwargs)
 
 
-def get_perf_model(*args, **kwargs):
-    """Stub function for performance model retrieval."""
-    raise NotImplementedError(
-        "Performance model requires aiconfigurator package. "
-        "Please install with: pip install aiconfigurator"
-    )
+__all__ = [
+    # Classes
+    "InferTimePredictor",
+    "ScheduleRequest",
+    "ScheduleBatch",
+    "AnalyticalTimePredictor",
+    "AIConfiguratorTimePredictor",
+    # Functions
+    "create_time_predictor",
+    "create_predictor",
+    "get_perf_model",
+    "is_aiconfigurator_available",
+    "get_supported_hardware",
+    "estimate_from_spec",
+    # Constants
+    "AI_CONFIGURATOR_AVAILABLE",
+]

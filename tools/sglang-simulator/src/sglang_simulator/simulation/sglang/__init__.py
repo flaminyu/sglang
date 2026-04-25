@@ -11,8 +11,16 @@ from sglang_simulator.simulation.sglang.mem_pool_host import (
 from sglang_simulator.simulation.sglang.model_runner import C_ModelRunnerHook
 from sglang_simulator.simulation.sglang.scheduler import C_SchedulerHook
 from sglang_simulator.simulation.sglang.sgl_kernel_hook import M_SGLangKernelLoadUtilHook
+from sglang_simulator.simulation.sglang.integrate import (
+    SimulationConfig,
+    BenchmarkConfig,
+    SimulatorLauncher,
+    AgentTraceRequestGenerator,
+    SGLangHTTPClient,
+)
 
 __all__ = [
+    # Hooks
     "C_SchedulerHook",
     "C_ModelRunnerHook",
     "C_StorageBackendFactory",
@@ -22,4 +30,10 @@ __all__ = [
     "C_MHATokenToKVPoolHostHook",
     "C_HostKVCacheHook",
     "M_SGLangKernelLoadUtilHook",
+    # Integration
+    "SimulationConfig",
+    "BenchmarkConfig",
+    "SimulatorLauncher",
+    "AgentTraceRequestGenerator",
+    "SGLangHTTPClient",
 ]
