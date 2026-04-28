@@ -1,0 +1,1832 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KV Cache Simulator - Comprehensive Experiment Report</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+                background: #f5f7fa; color: #333; line-height: 1.6; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        h1 { color: #2c3e50; margin-bottom: 10px; font-size: 2em; }
+        h2 { color: #34495e; margin: 30px 0 15px; border-bottom: 2px solid #3498db; padding-bottom: 8px; }
+        h3 { color: #7f8c8d; margin: 20px 0 10px; }
+        
+        .summary-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin: 20px 0; }
+        .card { background: white; border-radius: 10px; padding: 25px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .card h3 { color: #7f8c8d; font-size: 0.9em; text-transform: uppercase; margin: 0 0 10px; }
+        .card .value { font-size: 2.5em; font-weight: bold; color: #2c3e50; }
+        .card .sub { color: #95a5a6; font-size: 0.85em; margin-top: 5px; }
+        
+        .metric-good { color: #27ae60; }
+        .metric-bad { color: #e74c3c; }
+        
+        table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin: 15px 0; }
+        th { background: #3498db; color: white; padding: 15px 12px; text-align: left; font-weight: 600; }
+        td { padding: 12px; border-bottom: 1px solid #ecf0f1; }
+        tr:hover { background: #f8f9fa; }
+        tr:last-child td { border-bottom: none; }
+        
+        .config-section { margin: 30px 0; background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        
+        .timeline { position: relative; height: 60px; background: #ecf0f1; border-radius: 5px; margin: 10px 0; overflow: hidden; }
+        .timeline-bar { position: absolute; height: 100%; border-radius: 5px; display: flex; align-items: center; justify-content: center; color: white; font-size: 0.7em; overflow: hidden; }
+        
+        .tag { display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 0.75em; font-weight: bold; }
+        .tag-ttl { background: #9b59b6; color: white; }
+        .tag-non-ttl { background: #95a5a6; color: white; }
+        .tag-miss { background: #e74c3c; color: white; }
+        .tag-l0 { background: #f39c12; color: white; }
+        
+        .chart-container { background: white; border-radius: 10px; padding: 20px; margin: 15px 0; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        
+        .bar-chart { display: flex; align-items: flex-end; gap: 30px; height: 200px; padding: 20px; }
+        .bar-item { display: flex; flex-direction: column; align-items: center; flex: 1; }
+        .bar { width: 60px; background: linear-gradient(180deg, #3498db 0%, #2980b9 100%); border-radius: 5px 5px 0 0; transition: height 0.3s; }
+        .bar-label { margin-top: 10px; text-align: center; font-size: 0.85em; color: #7f8c8d; }
+        
+        .comparison-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+        @media (max-width: 800px) { .comparison-grid { grid-template-columns: 1fr; } }
+        
+        .footer { text-align: center; color: #95a5a6; margin-top: 40px; padding: 20px; border-top: 1px solid #ecf0f1; }
+        
+        .badge { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 0.7em; font-weight: bold; margin-left: 5px; }
+        .badge-speedup { background: #27ae60; color: white; }
+        .badge-slowdown { background: #e74c3c; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>KV Cache Simulator - Comprehensive Experiment Report</h1>
+        <p style="color: #7f8c8d;">Event-driven simulation with TTL priority scheduling</p>
+        
+        <div class="summary-cards">
+            <div class="card">
+                <h3>Experiments Run</h3>
+                <div class="value">18</div>
+                <div class="sub">Config pairs (Baseline vs TTL)</div>
+            </div>
+            <div class="card">
+                <h3>Program JCT Speedup</h3>
+                <div class="value metric-good">2.4532x</div>
+                <div class="sub">Per-program JCT average ratio</div>
+            </div>
+            <div class="card">
+                <h3>TTL JCT Improvement</h3>
+                <div class="value metric-good">92.2%</div>
+                <div class="sub">TTL vs Non-TTL request JCT</div>
+            </div>
+            <div class="card">
+                <h3>Duration Speedup (ref)</h3>
+                <div class="value metric-bad">0.9996x</div>
+                <div class="sub">Total duration ratio</div>
+            </div>
+        </div>
+        
+        <h2>Speedup by Configuration</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Configuration</th>
+                    <th>Baseline Duration</th>
+                    <th>TTL Duration</th>
+                    <th>Speedup</th>
+                    <th>TTL Hits</th>
+                    <th>JCT Improvement</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>cache=10000, progs=10, turns=10</td>
+                    <td>10.29s</td>
+                    <td>10.28s</td>
+                    <td class="metric-good">1.0014x <span class="badge badge-speedup">+0.14%</span></td>
+                    <td>80</td>
+                    <td>95.3%</td>
+                </tr>
+                <tr>
+                    <td>cache=10000, progs=10, turns=5</td>
+                    <td>5.02s</td>
+                    <td>5.00s</td>
+                    <td class="metric-good">1.0030x <span class="badge badge-speedup">+0.30%</span></td>
+                    <td>30</td>
+                    <td>90.4%</td>
+                </tr>
+                <tr>
+                    <td>cache=10000, progs=20, turns=10</td>
+                    <td>19.92s</td>
+                    <td>19.92s</td>
+                    <td class="metric-good">1.0000x <span class="badge badge-speedup">+0.00%</span></td>
+                    <td>160</td>
+                    <td>98.0%</td>
+                </tr>
+                <tr>
+                    <td>cache=10000, progs=20, turns=5</td>
+                    <td>9.90s</td>
+                    <td>9.90s</td>
+                    <td class="metric-good">1.0001x <span class="badge badge-speedup">+0.01%</span></td>
+                    <td>60</td>
+                    <td>95.7%</td>
+                </tr>
+                <tr>
+                    <td>cache=10000, progs=5, turns=10</td>
+                    <td>4.98s</td>
+                    <td>4.99s</td>
+                    <td class="metric-bad">0.9978x <span class="badge badge-slowdown">-0.22%</span></td>
+                    <td>40</td>
+                    <td>90.9%</td>
+                </tr>
+                <tr>
+                    <td>cache=10000, progs=5, turns=5</td>
+                    <td>2.57s</td>
+                    <td>2.58s</td>
+                    <td class="metric-bad">0.9942x <span class="badge badge-slowdown">-0.58%</span></td>
+                    <td>15</td>
+                    <td>83.7%</td>
+                </tr>
+                <tr>
+                    <td>cache=20000, progs=10, turns=10</td>
+                    <td>10.27s</td>
+                    <td>10.28s</td>
+                    <td class="metric-bad">0.9982x <span class="badge badge-slowdown">-0.18%</span></td>
+                    <td>80</td>
+                    <td>95.3%</td>
+                </tr>
+                <tr>
+                    <td>cache=20000, progs=10, turns=5</td>
+                    <td>5.01s</td>
+                    <td>5.01s</td>
+                    <td class="metric-bad">0.9996x <span class="badge badge-slowdown">-0.04%</span></td>
+                    <td>30</td>
+                    <td>90.2%</td>
+                </tr>
+                <tr>
+                    <td>cache=20000, progs=20, turns=10</td>
+                    <td>19.92s</td>
+                    <td>19.93s</td>
+                    <td class="metric-bad">0.9996x <span class="badge badge-slowdown">-0.04%</span></td>
+                    <td>160</td>
+                    <td>98.0%</td>
+                </tr>
+                <tr>
+                    <td>cache=20000, progs=20, turns=5</td>
+                    <td>9.90s</td>
+                    <td>9.93s</td>
+                    <td class="metric-bad">0.9976x <span class="badge badge-slowdown">-0.24%</span></td>
+                    <td>60</td>
+                    <td>95.7%</td>
+                </tr>
+                <tr>
+                    <td>cache=20000, progs=5, turns=10</td>
+                    <td>4.98s</td>
+                    <td>5.01s</td>
+                    <td class="metric-bad">0.9927x <span class="badge badge-slowdown">-0.73%</span></td>
+                    <td>40</td>
+                    <td>91.2%</td>
+                </tr>
+                <tr>
+                    <td>cache=20000, progs=5, turns=5</td>
+                    <td>2.58s</td>
+                    <td>2.59s</td>
+                    <td class="metric-bad">0.9954x <span class="badge badge-slowdown">-0.46%</span></td>
+                    <td>15</td>
+                    <td>82.7%</td>
+                </tr>
+                <tr>
+                    <td>cache=5000, progs=10, turns=10</td>
+                    <td>10.26s</td>
+                    <td>10.25s</td>
+                    <td class="metric-good">1.0006x <span class="badge badge-speedup">+0.06%</span></td>
+                    <td>80</td>
+                    <td>95.3%</td>
+                </tr>
+                <tr>
+                    <td>cache=5000, progs=10, turns=5</td>
+                    <td>5.01s</td>
+                    <td>5.00s</td>
+                    <td class="metric-good">1.0005x <span class="badge badge-speedup">+0.05%</span></td>
+                    <td>30</td>
+                    <td>90.1%</td>
+                </tr>
+                <tr>
+                    <td>cache=5000, progs=20, turns=10</td>
+                    <td>19.93s</td>
+                    <td>19.92s</td>
+                    <td class="metric-good">1.0008x <span class="badge badge-speedup">+0.08%</span></td>
+                    <td>160</td>
+                    <td>98.0%</td>
+                </tr>
+                <tr>
+                    <td>cache=5000, progs=20, turns=5</td>
+                    <td>9.91s</td>
+                    <td>9.91s</td>
+                    <td class="metric-bad">0.9996x <span class="badge badge-slowdown">-0.04%</span></td>
+                    <td>60</td>
+                    <td>95.7%</td>
+                </tr>
+                <tr>
+                    <td>cache=5000, progs=5, turns=10</td>
+                    <td>5.01s</td>
+                    <td>4.97s</td>
+                    <td class="metric-good">1.0082x <span class="badge badge-speedup">+0.82%</span></td>
+                    <td>40</td>
+                    <td>90.7%</td>
+                </tr>
+                <tr>
+                    <td>cache=5000, progs=5, turns=5</td>
+                    <td>2.59s</td>
+                    <td>2.58s</td>
+                    <td class="metric-good">1.0039x <span class="badge badge-speedup">+0.39%</span></td>
+                    <td>15</td>
+                    <td>83.1%</td>
+                </tr>
+            </tbody>
+        </table>
+        
+        <h2>JCT Distribution by Configuration</h2>
+
+        <div class="config-section">
+            <h3>cache=10000, progs=10, turns=10</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>80</td>
+                        <td>83.3ms</td>
+                        <td>90.0ms</td>
+                        <td>105.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>20</td>
+                        <td>1756.6ms</td>
+                        <td>97.5ms</td>
+                        <td>7878.8ms</td>
+                        <td>7878.8ms</td>
+                        <td>310.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>100</td>
+                        <td>417.9ms</td>
+                        <td>90.0ms</td>
+                        <td>3190.0ms</td>
+                        <td>7878.8ms</td>
+                        <td>62.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=10000, progs=10, turns=5</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>30</td>
+                        <td>89.7ms</td>
+                        <td>90.0ms</td>
+                        <td>200.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>20</td>
+                        <td>932.3ms</td>
+                        <td>105.0ms</td>
+                        <td>3657.8ms</td>
+                        <td>3657.8ms</td>
+                        <td>335.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>50</td>
+                        <td>426.7ms</td>
+                        <td>90.0ms</td>
+                        <td>3152.6ms</td>
+                        <td>3657.8ms</td>
+                        <td>134.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=10000, progs=20, turns=10</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>160</td>
+                        <td>83.5ms</td>
+                        <td>90.0ms</td>
+                        <td>105.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>40</td>
+                        <td>4170.5ms</td>
+                        <td>103.1ms</td>
+                        <td>16032.3ms</td>
+                        <td>17541.1ms</td>
+                        <td>810.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>200</td>
+                        <td>900.9ms</td>
+                        <td>90.0ms</td>
+                        <td>9007.9ms</td>
+                        <td>16032.3ms</td>
+                        <td>162.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=10000, progs=20, turns=5</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>60</td>
+                        <td>91.3ms</td>
+                        <td>90.0ms</td>
+                        <td>200.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>40</td>
+                        <td>2139.4ms</td>
+                        <td>105.0ms</td>
+                        <td>8103.6ms</td>
+                        <td>8490.5ms</td>
+                        <td>825.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>100</td>
+                        <td>910.5ms</td>
+                        <td>90.0ms</td>
+                        <td>6671.7ms</td>
+                        <td>8490.5ms</td>
+                        <td>330.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=10000, progs=5, turns=10</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>40</td>
+                        <td>55.2ms</td>
+                        <td>90.0ms</td>
+                        <td>90.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>10</td>
+                        <td>608.7ms</td>
+                        <td>104.0ms</td>
+                        <td>2761.7ms</td>
+                        <td>2761.7ms</td>
+                        <td>90.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>50</td>
+                        <td>165.9ms</td>
+                        <td>90.0ms</td>
+                        <td>287.4ms</td>
+                        <td>2761.7ms</td>
+                        <td>18.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=10000, progs=5, turns=5</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>15</td>
+                        <td>57.3ms</td>
+                        <td>90.0ms</td>
+                        <td>200.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>10</td>
+                        <td>351.1ms</td>
+                        <td>104.5ms</td>
+                        <td>1568.8ms</td>
+                        <td>1568.8ms</td>
+                        <td>110.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>25</td>
+                        <td>174.9ms</td>
+                        <td>90.0ms</td>
+                        <td>1233.9ms</td>
+                        <td>1568.8ms</td>
+                        <td>44.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=20000, progs=10, turns=10</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>80</td>
+                        <td>83.3ms</td>
+                        <td>90.0ms</td>
+                        <td>105.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>20</td>
+                        <td>1772.7ms</td>
+                        <td>105.0ms</td>
+                        <td>7816.6ms</td>
+                        <td>7816.6ms</td>
+                        <td>320.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>100</td>
+                        <td>421.1ms</td>
+                        <td>90.0ms</td>
+                        <td>3253.7ms</td>
+                        <td>7816.6ms</td>
+                        <td>64.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=20000, progs=10, turns=5</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>30</td>
+                        <td>89.7ms</td>
+                        <td>90.0ms</td>
+                        <td>200.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>20</td>
+                        <td>917.6ms</td>
+                        <td>101.4ms</td>
+                        <td>3518.3ms</td>
+                        <td>3518.3ms</td>
+                        <td>325.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>50</td>
+                        <td>420.9ms</td>
+                        <td>90.0ms</td>
+                        <td>3164.7ms</td>
+                        <td>3518.3ms</td>
+                        <td>130.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=20000, progs=20, turns=10</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>160</td>
+                        <td>83.5ms</td>
+                        <td>90.0ms</td>
+                        <td>105.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>40</td>
+                        <td>4168.5ms</td>
+                        <td>105.0ms</td>
+                        <td>15981.2ms</td>
+                        <td>17664.4ms</td>
+                        <td>810.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>200</td>
+                        <td>900.5ms</td>
+                        <td>90.0ms</td>
+                        <td>8991.3ms</td>
+                        <td>15981.2ms</td>
+                        <td>162.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=20000, progs=20, turns=5</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>60</td>
+                        <td>91.3ms</td>
+                        <td>90.0ms</td>
+                        <td>200.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>40</td>
+                        <td>2126.9ms</td>
+                        <td>105.0ms</td>
+                        <td>8008.6ms</td>
+                        <td>8360.6ms</td>
+                        <td>812.5ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>100</td>
+                        <td>905.5ms</td>
+                        <td>90.0ms</td>
+                        <td>6634.1ms</td>
+                        <td>8360.6ms</td>
+                        <td>325.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=20000, progs=5, turns=10</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>40</td>
+                        <td>55.3ms</td>
+                        <td>90.0ms</td>
+                        <td>90.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>10</td>
+                        <td>625.0ms</td>
+                        <td>105.0ms</td>
+                        <td>2981.7ms</td>
+                        <td>2981.7ms</td>
+                        <td>90.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>50</td>
+                        <td>169.2ms</td>
+                        <td>90.0ms</td>
+                        <td>270.7ms</td>
+                        <td>2981.7ms</td>
+                        <td>18.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=20000, progs=5, turns=5</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>15</td>
+                        <td>57.3ms</td>
+                        <td>90.0ms</td>
+                        <td>200.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>10</td>
+                        <td>330.8ms</td>
+                        <td>97.5ms</td>
+                        <td>1549.3ms</td>
+                        <td>1549.3ms</td>
+                        <td>100.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>25</td>
+                        <td>166.7ms</td>
+                        <td>90.0ms</td>
+                        <td>1182.0ms</td>
+                        <td>1549.3ms</td>
+                        <td>40.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=5000, progs=10, turns=10</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>80</td>
+                        <td>83.3ms</td>
+                        <td>90.0ms</td>
+                        <td>105.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>20</td>
+                        <td>1774.2ms</td>
+                        <td>105.0ms</td>
+                        <td>7857.5ms</td>
+                        <td>7857.5ms</td>
+                        <td>325.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>100</td>
+                        <td>421.4ms</td>
+                        <td>90.0ms</td>
+                        <td>3233.2ms</td>
+                        <td>7857.5ms</td>
+                        <td>65.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=5000, progs=10, turns=5</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>30</td>
+                        <td>89.7ms</td>
+                        <td>90.0ms</td>
+                        <td>200.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>20</td>
+                        <td>902.0ms</td>
+                        <td>99.8ms</td>
+                        <td>3580.4ms</td>
+                        <td>3580.4ms</td>
+                        <td>320.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>50</td>
+                        <td>414.6ms</td>
+                        <td>90.0ms</td>
+                        <td>3015.5ms</td>
+                        <td>3580.4ms</td>
+                        <td>128.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=5000, progs=20, turns=10</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>160</td>
+                        <td>83.5ms</td>
+                        <td>90.0ms</td>
+                        <td>105.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>40</td>
+                        <td>4166.3ms</td>
+                        <td>105.0ms</td>
+                        <td>15968.3ms</td>
+                        <td>17774.4ms</td>
+                        <td>800.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>200</td>
+                        <td>900.1ms</td>
+                        <td>90.0ms</td>
+                        <td>8963.1ms</td>
+                        <td>15968.3ms</td>
+                        <td>160.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=5000, progs=20, turns=5</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>60</td>
+                        <td>91.3ms</td>
+                        <td>90.0ms</td>
+                        <td>200.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>40</td>
+                        <td>2116.7ms</td>
+                        <td>105.0ms</td>
+                        <td>8017.6ms</td>
+                        <td>8288.9ms</td>
+                        <td>805.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>100</td>
+                        <td>901.4ms</td>
+                        <td>90.0ms</td>
+                        <td>6600.9ms</td>
+                        <td>8288.9ms</td>
+                        <td>322.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=5000, progs=5, turns=10</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>40</td>
+                        <td>55.2ms</td>
+                        <td>90.0ms</td>
+                        <td>90.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>10</td>
+                        <td>592.7ms</td>
+                        <td>103.9ms</td>
+                        <td>2701.6ms</td>
+                        <td>2701.6ms</td>
+                        <td>80.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>50</td>
+                        <td>162.7ms</td>
+                        <td>90.0ms</td>
+                        <td>294.5ms</td>
+                        <td>2701.6ms</td>
+                        <td>16.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=5000, progs=5, turns=5</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Count</th>
+                        <th>Avg JCT</th>
+                        <th>P50 JCT</th>
+                        <th>P95 JCT</th>
+                        <th>P99 JCT</th>
+                        <th>Avg Queue Delay</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><span class="tag tag-ttl">TTL</span></td>
+                        <td>15</td>
+                        <td>57.3ms</td>
+                        <td>90.0ms</td>
+                        <td>200.0ms</td>
+                        <td>200.0ms</td>
+                        <td>0.0ms</td>
+                    </tr>
+                    <tr>
+                        <td><span class="tag tag-non-ttl">Non-TTL</span></td>
+                        <td>10</td>
+                        <td>338.8ms</td>
+                        <td>97.5ms</td>
+                        <td>1576.1ms</td>
+                        <td>1576.1ms</td>
+                        <td>110.0ms</td>
+                    </tr>
+                    <tr style="font-weight: bold; background: #f8f9fa;">
+                        <td>Overall</td>
+                        <td>25</td>
+                        <td>169.9ms</td>
+                        <td>90.0ms</td>
+                        <td>1185.3ms</td>
+                        <td>1576.1ms</td>
+                        <td>44.0ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <h2>Timeline Visualization</h2>
+        <p style="color: #7f8c8d; margin-bottom: 20px;">Showing first 3 programs per configuration - each bar represents JCT</p>
+
+        <div class="config-section">
+            <h3>cache=10000, progs=10, turns=10</h3>
+
+            <h4 style="margin: 15px 0 10px;">Program: prog000</h4>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn0</span>
+                    <span class="tag tag-miss">Miss</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 100.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">3190ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn1</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 2.821277157038887%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn2</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 2.821277157038887%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn3</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 2.8212771570388737%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn4</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 2.8212771570388737%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn5</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 2.8212771570388737%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn6</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 2.8212771570388737%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn7</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 2.8212771570388737%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn8</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 3.291490016545371%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">105ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn9</span>
+                    <span class="tag tag-l0">L0</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 2.8212771570388737%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <h4 style="margin: 15px 0 10px;">Program: prog001</h4>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn0</span>
+                    <span class="tag tag-miss">Miss</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 100.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">7879ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn1</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 1.1423056308306285%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn2</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 1.1423056308306285%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn3</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 1.1423056308306285%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn4</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">0ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn5</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">0ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn6</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">0ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn7</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">0ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn8</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">0ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn9</span>
+                    <span class="tag tag-l0">L0</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">0ms</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <h4 style="margin: 15px 0 10px;">Program: prog002</h4>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn0</span>
+                    <span class="tag tag-miss">Miss</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 100.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">5252ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn1</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 1.7135029049112276%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn2</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 1.7135029049112276%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn3</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.19038921165681622%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">10ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn4</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.19038921165681622%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">10ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn5</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 1.7135029049112276%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn6</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 1.7135029049112276%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn7</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 1.7135029049112276%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn8</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 1.7135029049112276%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn9</span>
+                    <span class="tag tag-l0">L0</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 1.7135029049112276%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=10000, progs=10, turns=5</h3>
+
+            <h4 style="margin: 15px 0 10px;">Program: prog000</h4>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn0</span>
+                    <span class="tag tag-miss">Miss</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 100.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">309ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn1</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 29.104352140906446%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn2</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 29.104352140906446%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn3</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 29.10435214090648%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn4</span>
+                    <span class="tag tag-l0">L0</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 33.9550774977242%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">105ms</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <h4 style="margin: 15px 0 10px;">Program: prog001</h4>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn0</span>
+                    <span class="tag tag-miss">Miss</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 100.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">3345ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn1</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 2.6904140350087724%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn2</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 3.13881637417689%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">105ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn3</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 2.690414035008759%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn4</span>
+                    <span class="tag tag-l0">L0</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 2.690414035008759%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <h4 style="margin: 15px 0 10px;">Program: prog002</h4>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn0</span>
+                    <span class="tag tag-miss">Miss</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">0ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn1</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 11.111111111111093%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">10ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn2</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 11.111111111111125%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">10ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn3</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 100.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn4</span>
+                    <span class="tag tag-l0">L0</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 100.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="config-section">
+            <h3>cache=10000, progs=20, turns=10</h3>
+
+            <h4 style="margin: 15px 0 10px;">Program: prog000</h4>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn0</span>
+                    <span class="tag tag-miss">Miss</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 100.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">10741ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn1</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.8378807623590911%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn2</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.8378807623590911%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn3</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.8378807623590911%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn4</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.8378807623590911%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn5</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.0930978624843398%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">10ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn6</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.0930978624843398%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">10ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn7</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.8378807623590911%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn8</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.8378807623590911%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog000_turn9</span>
+                    <span class="tag tag-l0">L0</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.8378807623590911%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <h4 style="margin: 15px 0 10px;">Program: prog001</h4>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn0</span>
+                    <span class="tag tag-miss">Miss</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 100.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">9209ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn1</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.9773424806159481%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn2</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.9773424806159481%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn3</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.9773424806159481%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn4</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.9773424806159481%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn5</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.9773424806159481%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn6</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 1.1402328940519233%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">105ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn7</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.9773424806159481%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn8</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.9773424806159481%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog001_turn9</span>
+                    <span class="tag tag-l0">L0</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 0.9773424806159481%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <h4 style="margin: 15px 0 10px;">Program: prog002</h4>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn0</span>
+                    <span class="tag tag-miss">Miss</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 100.0%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">305ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn1</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 29.515748555055886%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn2</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 29.515748555055886%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn3</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 29.51574855505592%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn4</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 29.515748555055847%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn5</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 29.515748555055847%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn6</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 29.515748555055847%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn7</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 29.515748555055993%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn8</span>
+                    <span class="tag tag-ttl">TTL</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 29.515748555055993%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">90ms</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="width: 80px; font-size: 0.8em;">prog002_turn9</span>
+                    <span class="tag tag-l0">L0</span>
+                    <div style="flex: 1; height: 25px; background: #ecf0f1; border-radius: 5px; overflow: hidden;">
+                        <div style="width: 34.43503998089854%; height: 100%; background: linear-gradient(90deg, #3498db, #2980b9); border-radius: 5px; display: flex; align-items: center; justify-content: flex-end; padding-right: 5px;">
+                            <span style="color: white; font-size: 0.75em; font-weight: bold;">105ms</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <h2>Key Findings</h2>
+        <div class="config-section">
+            <h3>1. TTL Priority Scheduling</h3>
+            <p>TTL-pinned programs receive priority in scheduling, allowing them to bypass the queue and complete faster. 
+            This results in an average <strong>JCT improvement of 92.2%</strong> for TTL requests.</p>
+            
+            <h3>2. Queue Delay Reduction</h3>
+            <p>TTL requests experience <strong>zero queue delay</strong> on average, while non-TTL requests face significant queue wait times.
+            This is the primary benefit of TTL priority scheduling.</p>
+            
+            <h3>3. Trade-off</h3>
+            <p>While TTL requests benefit from priority scheduling, non-TTL requests may experience slightly longer JCT 
+            due to being preempted. However, the overall system performance remains comparable.</p>
+            
+            <h3>4. Duration (Total Time)</h3>
+            <p>Total simulation duration remains nearly identical between Baseline and TTL modes because:</p>
+            <ul style="margin-left: 20px; margin-top: 10px;">
+                <li>GPU utilization stays at 100% (always processing requests)</li>
+                <li>Each request's processing time is the same</li>
+                <li>Only the order of completion changes</li>
+            </ul>
+        </div>
+        
+        <div class="footer">
+            <p>Generated by KV Cache Simulator - Comprehensive Experiment</p>
+            <p style="font-size: 0.8em; margin-top: 5px;">Settings: poisson_lambda=0.1, tool_execution_time=0.1s, default_ttl=5.0s</p>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,32 @@
+{
+  "scenario": {
+    "l0_size": 20000,
+    "concurrency": 30,
+    "turns": 15
+  },
+  "baseline": {
+    "duration": 760.9808599842786,
+    "hit_types": {
+      "Miss": 238,
+      "L0": 144,
+      "L1": 68
+    },
+    "avg_prefill_ms": 1435.2444444444445,
+    "avg_decode_ms": 205.05599999999998
+  },
+  "ttl": {
+    "duration": 521.2360599842773,
+    "hit_types": {
+      "Miss": 156,
+      "L0": 55,
+      "TTL": 219,
+      "L1": 20
+    },
+    "avg_prefill_ms": 976.8666666666667,
+    "avg_decode_ms": 130.176
+  },
+  "comparison": {
+    "speedup": 1.4599543631099372,
+    "time_saved": 239.7448000000013
+  }
+}

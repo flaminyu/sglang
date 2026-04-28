@@ -1,0 +1,2179 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Request Scheduling Timeline - Multi Row</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1419; color: #e7e9ea; padding: 20px; }
+        h1 { color: #1d9bf0; margin-bottom: 10px; font-size: 1.5em; }
+        h2 { color: #71767b; margin: 20px 0 10px; font-size: 1.1em; }
+        .info { color: #71767b; margin-bottom: 20px; font-size: 0.9em; }
+        
+        /* Multi-row timeline container */
+        .timeline-container {
+            background: #16181c;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 30px;
+            overflow-x: auto;
+        }
+        
+        /* Time scale */
+        .time-scale {
+            display: flex;
+            margin-bottom: 10px;
+            font-size: 0.7em;
+            color: #71767b;
+            min-width: 10980px;
+            border-bottom: 1px solid #3f4346;
+            padding-bottom: 5px;
+        }
+        .time-mark {
+            flex: 1;
+            text-align: center;
+            border-left: 1px solid #3f4346;
+            padding-left: 2px;
+        }
+        
+        /* Timeline rows container */
+        .timeline-rows {
+            position: relative;
+            min-width: 10980px;
+        }
+        
+        /* Individual timeline row */
+        .timeline-row {
+            position: relative;
+            height: 36px;
+            margin-bottom: 4px;
+            background: #2f3336;
+            border-radius: 4px;
+        }
+        .timeline-row:nth-child(odd) {
+            background: #282d32;
+        }
+        
+        /* Request blocks */
+        .request-block {
+            position: absolute;
+            height: 28px;
+            top: 4px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.65em;
+            font-weight: 700;
+            color: #fff;
+            cursor: pointer;
+            transition: transform 0.15s, box-shadow 0.15s;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+            overflow: hidden;
+            white-space: nowrap;
+        }
+        .request-block:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            z-index: 100;
+        }
+        
+        /* Hit types coloring */
+        .hit-miss { background: linear-gradient(135deg, #f4212e, #d91a28); }
+        .hit-l0 { background: linear-gradient(135deg, #f7931a, #e08815); }
+        .hit-ttl { background: linear-gradient(135deg, #00ba7c, #00a06d); }
+        .hit-l1 { background: linear-gradient(135deg, #794bc4, #6840b0); }
+        
+        /* Tooltip */
+        .tooltip {
+            position: fixed;
+            background: #2f3336;
+            border: 1px solid #3f4346;
+            border-radius: 8px;
+            padding: 12px;
+            font-size: 0.85em;
+            max-width: 350px;
+            z-index: 1000;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            display: none;
+        }
+        .tooltip.show { display: block; }
+        .tooltip-title { color: #1d9bf0; font-weight: 600; margin-bottom: 8px; }
+        .tooltip-row { display: flex; justify-content: space-between; margin: 4px 0; }
+        .tooltip-label { color: #71767b; }
+        .tooltip-value { color: #e7e9ea; }
+        
+        /* Stats table */
+        .stats-table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+        .stats-table th { color: #71767b; text-align: left; padding: 8px; border-bottom: 1px solid #2f3336; }
+        .stats-table td { padding: 8px; border-bottom: 1px solid #2f3336; }
+        .stats-table tr:hover { background: #1e2024; }
+        
+        /* Legend */
+        .legend { display: flex; gap: 20px; margin: 15px 0; font-size: 0.85em; }
+        .legend-item { display: flex; align-items: center; gap: 6px; }
+        .legend-color { width: 16px; height: 16px; border-radius: 3px; }
+        
+        /* Summary stats */
+        .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0; }
+        .stat-box { background: #16181c; border-radius: 8px; padding: 15px; text-align: center; }
+        .stat-value { font-size: 1.8em; font-weight: 700; color: #1d9bf0; }
+        .stat-label { color: #71767b; font-size: 0.8em; margin-top: 4px; }
+    </style>
+</head>
+<body>
+    <h1>Request Scheduling Timeline</h1>
+    <div class="info">
+        <strong>Config:</strong> Poisson arrival (λ=0.5), 
+        tool_execution_time=0.5s | 
+        <strong>Programs:</strong> 20 | 
+        <strong>Total Requests:</strong> 74
+        <br>
+        <span style="color: #71767b; font-size: 0.85em;">← Scroll horizontally to see all requests →</span>
+    </div>
+    
+    <div class="legend">
+        <div class="legend-item">
+            <div class="legend-color hit-miss"></div>
+            <span>Miss</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color hit-l0"></div>
+            <span>L0 Hit</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color hit-ttl"></div>
+            <span>TTL Hit</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color hit-l1"></div>
+            <span>L1 Hit</span>
+        </div>
+    </div>
+    
+    <!-- Summary Stats -->
+    <div class="summary">
+        <div class="stat-box">
+            <div class="stat-value">74</div>
+            <div class="stat-label">Total Requests</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-value">1</div>
+            <div class="stat-label">Cache Misses</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-value">73</div>
+            <div class="stat-label">Cache Hits</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-value">18.13s</div>
+            <div class="stat-label">Avg Turn Duration</div>
+        </div>
+    </div>
+    
+    <!-- Multi Row Timeline -->
+    <h2>Timeline (1 Rows)</h2>
+    <div class="timeline-container">
+        <!-- Time Scale -->
+        <div class="time-scale">
+<div class="time-mark">0.0s</div><div class="time-mark">3.6s</div><div class="time-mark">7.2s</div><div class="time-mark">10.8s</div><div class="time-mark">14.4s</div><div class="time-mark">18.0s</div><div class="time-mark">21.6s</div><div class="time-mark">25.2s</div><div class="time-mark">28.8s</div><div class="time-mark">32.3s</div><div class="time-mark">35.9s</div>        </div>
+        
+        <!-- Timeline Rows -->
+        <div class="timeline-rows">
+            <div class="timeline-row" id="row-0">
+                <div class="request-block hit-miss" 
+                     style="left: 0.0px; width: 131.4px;"
+                     data-rid="P19_T0"
+                     data-arrival="0.003"
+                     data-start="0.003"
+                     data-finish="0.441"
+                     data-hit="Miss"
+                     data-queue-wait="0.0ms"
+                     data-inference="0.438s"
+                     data-program="P19"
+                     data-turn="0"
+                     title="P19_0">
+                    P19_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 131.4px; width: 101.4px;"
+                     data-rid="P01_T0"
+                     data-arrival="0.013"
+                     data-start="0.441"
+                     data-finish="0.779"
+                     data-hit="L0"
+                     data-queue-wait="428.6ms"
+                     data-inference="0.338s"
+                     data-program="P01"
+                     data-turn="0"
+                     title="P1_0">
+                    P1_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 232.8px; width: 101.4px;"
+                     data-rid="P12_T0"
+                     data-arrival="0.013"
+                     data-start="0.779"
+                     data-finish="1.117"
+                     data-hit="L0"
+                     data-queue-wait="765.8ms"
+                     data-inference="0.338s"
+                     data-program="P12"
+                     data-turn="0"
+                     title="P12_0">
+                    P12_0
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 334.2px; width: 131.4px;"
+                     data-rid="P19_T1"
+                     data-arrival="0.941"
+                     data-start="1.117"
+                     data-finish="1.555"
+                     data-hit="TTL"
+                     data-queue-wait="176.0ms"
+                     data-inference="0.438s"
+                     data-program="P19"
+                     data-turn="1"
+                     title="P19_1">
+                    P19_1
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 465.6px; width: 131.4px;"
+                     data-rid="P01_T1"
+                     data-arrival="1.279"
+                     data-start="1.555"
+                     data-finish="1.993"
+                     data-hit="TTL"
+                     data-queue-wait="276.0ms"
+                     data-inference="0.438s"
+                     data-program="P01"
+                     data-turn="1"
+                     title="P1_1">
+                    P1_1
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 597.0px; width: 131.4px;"
+                     data-rid="P12_T1"
+                     data-arrival="1.617"
+                     data-start="1.993"
+                     data-finish="2.431"
+                     data-hit="TTL"
+                     data-queue-wait="376.0ms"
+                     data-inference="0.438s"
+                     data-program="P12"
+                     data-turn="1"
+                     title="P12_1">
+                    P12_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 728.4px; width: 161.4px;"
+                     data-rid="P19_T2"
+                     data-arrival="2.055"
+                     data-start="2.431"
+                     data-finish="2.969"
+                     data-hit="L0"
+                     data-queue-wait="376.0ms"
+                     data-inference="0.538s"
+                     data-program="P19"
+                     data-turn="2"
+                     title="P19_2">
+                    P19_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 889.8px; width: 161.4px;"
+                     data-rid="P01_T2"
+                     data-arrival="2.493"
+                     data-start="2.969"
+                     data-finish="3.507"
+                     data-hit="TTL"
+                     data-queue-wait="476.0ms"
+                     data-inference="0.538s"
+                     data-program="P01"
+                     data-turn="2"
+                     title="P1_2">
+                    P1_2
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 1051.2px; width: 161.4px;"
+                     data-rid="P12_T2"
+                     data-arrival="2.931"
+                     data-start="3.507"
+                     data-finish="4.045"
+                     data-hit="L0"
+                     data-queue-wait="576.0ms"
+                     data-inference="0.538s"
+                     data-program="P12"
+                     data-turn="2"
+                     title="P12_2">
+                    P12_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 1212.6px; width: 191.4px;"
+                     data-rid="P01_T3"
+                     data-arrival="4.007"
+                     data-start="4.045"
+                     data-finish="4.683"
+                     data-hit="TTL"
+                     data-queue-wait="38.0ms"
+                     data-inference="0.638s"
+                     data-program="P01"
+                     data-turn="3"
+                     title="P1_3">
+                    P1_3
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 1404.0px; width: 101.4px;"
+                     data-rid="P09_T0"
+                     data-arrival="0.015"
+                     data-start="4.683"
+                     data-finish="5.021"
+                     data-hit="L0"
+                     data-queue-wait="4668.1ms"
+                     data-inference="0.338s"
+                     data-program="P09"
+                     data-turn="0"
+                     title="P9_0">
+                    P9_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 1505.4px; width: 101.4px;"
+                     data-rid="P07_T0"
+                     data-arrival="0.045"
+                     data-start="5.021"
+                     data-finish="5.359"
+                     data-hit="L0"
+                     data-queue-wait="4975.8ms"
+                     data-inference="0.338s"
+                     data-program="P07"
+                     data-turn="0"
+                     title="P7_0">
+                    P7_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 1606.8px; width: 221.4px;"
+                     data-rid="P01_T4"
+                     data-arrival="5.183"
+                     data-start="5.359"
+                     data-finish="6.097"
+                     data-hit="L0"
+                     data-queue-wait="176.0ms"
+                     data-inference="0.738s"
+                     data-program="P01"
+                     data-turn="4"
+                     title="P1_4">
+                    P1_4
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 1828.2px; width: 131.4px;"
+                     data-rid="P09_T1"
+                     data-arrival="5.521"
+                     data-start="6.097"
+                     data-finish="6.535"
+                     data-hit="TTL"
+                     data-queue-wait="576.0ms"
+                     data-inference="0.438s"
+                     data-program="P09"
+                     data-turn="1"
+                     title="P9_1">
+                    P9_1
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 1959.6px; width: 131.4px;"
+                     data-rid="P07_T1"
+                     data-arrival="5.859"
+                     data-start="6.535"
+                     data-finish="6.973"
+                     data-hit="TTL"
+                     data-queue-wait="676.0ms"
+                     data-inference="0.438s"
+                     data-program="P07"
+                     data-turn="1"
+                     title="P7_1">
+                    P7_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 2091.0px; width: 101.4px;"
+                     data-rid="P13_T0"
+                     data-arrival="0.111"
+                     data-start="6.973"
+                     data-finish="7.311"
+                     data-hit="L0"
+                     data-queue-wait="6862.4ms"
+                     data-inference="0.338s"
+                     data-program="P13"
+                     data-turn="0"
+                     title="P13_0">
+                    P13_0
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 2192.4px; width: 161.4px;"
+                     data-rid="P09_T2"
+                     data-arrival="7.035"
+                     data-start="7.311"
+                     data-finish="7.849"
+                     data-hit="TTL"
+                     data-queue-wait="276.0ms"
+                     data-inference="0.538s"
+                     data-program="P09"
+                     data-turn="2"
+                     title="P9_2">
+                    P9_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 2353.8px; width: 161.4px;"
+                     data-rid="P07_T2"
+                     data-arrival="7.473"
+                     data-start="7.849"
+                     data-finish="8.387"
+                     data-hit="TTL"
+                     data-queue-wait="376.0ms"
+                     data-inference="0.538s"
+                     data-program="P07"
+                     data-turn="2"
+                     title="P7_2">
+                    P7_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 2515.2px; width: 191.4px;"
+                     data-rid="P09_T3"
+                     data-arrival="8.349"
+                     data-start="8.387"
+                     data-finish="9.025"
+                     data-hit="TTL"
+                     data-queue-wait="38.0ms"
+                     data-inference="0.638s"
+                     data-program="P09"
+                     data-turn="3"
+                     title="P9_3">
+                    P9_3
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 2706.6px; width: 191.4px;"
+                     data-rid="P07_T3"
+                     data-arrival="8.887"
+                     data-start="9.025"
+                     data-finish="9.663"
+                     data-hit="TTL"
+                     data-queue-wait="138.0ms"
+                     data-inference="0.638s"
+                     data-program="P07"
+                     data-turn="3"
+                     title="P7_3">
+                    P7_3
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 2898.0px; width: 221.4px;"
+                     data-rid="P09_T4"
+                     data-arrival="9.525"
+                     data-start="9.663"
+                     data-finish="10.401"
+                     data-hit="L0"
+                     data-queue-wait="138.0ms"
+                     data-inference="0.738s"
+                     data-program="P09"
+                     data-turn="4"
+                     title="P9_4">
+                    P9_4
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 3119.4px; width: 221.4px;"
+                     data-rid="P07_T4"
+                     data-arrival="10.163"
+                     data-start="10.401"
+                     data-finish="11.139"
+                     data-hit="L0"
+                     data-queue-wait="238.0ms"
+                     data-inference="0.738s"
+                     data-program="P07"
+                     data-turn="4"
+                     title="P7_4">
+                    P7_4
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 3340.8px; width: 131.4px;"
+                     data-rid="P13_T1"
+                     data-arrival="7.811"
+                     data-start="11.139"
+                     data-finish="11.577"
+                     data-hit="TTL"
+                     data-queue-wait="3328.0ms"
+                     data-inference="0.438s"
+                     data-program="P13"
+                     data-turn="1"
+                     title="P13_1">
+                    P13_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 3472.2px; width: 101.4px;"
+                     data-rid="P10_T0"
+                     data-arrival="0.123"
+                     data-start="11.577"
+                     data-finish="11.915"
+                     data-hit="L0"
+                     data-queue-wait="11453.9ms"
+                     data-inference="0.338s"
+                     data-program="P10"
+                     data-turn="0"
+                     title="P10_0">
+                    P10_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 3573.6px; width: 101.4px;"
+                     data-rid="P16_T0"
+                     data-arrival="0.125"
+                     data-start="11.915"
+                     data-finish="12.253"
+                     data-hit="L0"
+                     data-queue-wait="11790.7ms"
+                     data-inference="0.338s"
+                     data-program="P16"
+                     data-turn="0"
+                     title="P16_0">
+                    P16_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 3675.0px; width: 161.4px;"
+                     data-rid="P13_T2"
+                     data-arrival="12.077"
+                     data-start="12.253"
+                     data-finish="12.791"
+                     data-hit="L0"
+                     data-queue-wait="176.0ms"
+                     data-inference="0.538s"
+                     data-program="P13"
+                     data-turn="2"
+                     title="P13_2">
+                    P13_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 3836.4px; width: 131.4px;"
+                     data-rid="P10_T1"
+                     data-arrival="12.415"
+                     data-start="12.791"
+                     data-finish="13.229"
+                     data-hit="TTL"
+                     data-queue-wait="376.0ms"
+                     data-inference="0.438s"
+                     data-program="P10"
+                     data-turn="1"
+                     title="P10_1">
+                    P10_1
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 3967.8px; width: 131.4px;"
+                     data-rid="P16_T1"
+                     data-arrival="12.753"
+                     data-start="13.229"
+                     data-finish="13.667"
+                     data-hit="TTL"
+                     data-queue-wait="476.0ms"
+                     data-inference="0.438s"
+                     data-program="P16"
+                     data-turn="1"
+                     title="P16_1">
+                    P16_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 4099.2px; width: 101.4px;"
+                     data-rid="P03_T0"
+                     data-arrival="0.126"
+                     data-start="13.667"
+                     data-finish="14.005"
+                     data-hit="L0"
+                     data-queue-wait="13541.0ms"
+                     data-inference="0.338s"
+                     data-program="P03"
+                     data-turn="0"
+                     title="P3_0">
+                    P3_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 4200.6px; width: 161.4px;"
+                     data-rid="P10_T2"
+                     data-arrival="13.729"
+                     data-start="14.005"
+                     data-finish="14.543"
+                     data-hit="L0"
+                     data-queue-wait="276.0ms"
+                     data-inference="0.538s"
+                     data-program="P10"
+                     data-turn="2"
+                     title="P10_2">
+                    P10_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 4362.0px; width: 161.4px;"
+                     data-rid="P16_T2"
+                     data-arrival="14.167"
+                     data-start="14.543"
+                     data-finish="15.081"
+                     data-hit="TTL"
+                     data-queue-wait="376.0ms"
+                     data-inference="0.538s"
+                     data-program="P16"
+                     data-turn="2"
+                     title="P16_2">
+                    P16_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 4523.4px; width: 131.4px;"
+                     data-rid="P03_T1"
+                     data-arrival="14.505"
+                     data-start="15.081"
+                     data-finish="15.519"
+                     data-hit="TTL"
+                     data-queue-wait="576.0ms"
+                     data-inference="0.438s"
+                     data-program="P03"
+                     data-turn="1"
+                     title="P3_1">
+                    P3_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 4654.8px; width: 101.4px;"
+                     data-rid="P02_T0"
+                     data-arrival="0.161"
+                     data-start="15.519"
+                     data-finish="15.857"
+                     data-hit="L0"
+                     data-queue-wait="15358.4ms"
+                     data-inference="0.338s"
+                     data-program="P02"
+                     data-turn="0"
+                     title="P2_0">
+                    P2_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 4756.2px; width: 191.4px;"
+                     data-rid="P16_T3"
+                     data-arrival="15.581"
+                     data-start="15.857"
+                     data-finish="16.495"
+                     data-hit="L0"
+                     data-queue-wait="276.0ms"
+                     data-inference="0.638s"
+                     data-program="P16"
+                     data-turn="3"
+                     title="P16_3">
+                    P16_3
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 4947.6px; width: 161.4px;"
+                     data-rid="P03_T2"
+                     data-arrival="16.019"
+                     data-start="16.495"
+                     data-finish="17.033"
+                     data-hit="TTL"
+                     data-queue-wait="476.0ms"
+                     data-inference="0.538s"
+                     data-program="P03"
+                     data-turn="2"
+                     title="P3_2">
+                    P3_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 5109.0px; width: 131.4px;"
+                     data-rid="P02_T1"
+                     data-arrival="16.357"
+                     data-start="17.033"
+                     data-finish="17.471"
+                     data-hit="TTL"
+                     data-queue-wait="676.0ms"
+                     data-inference="0.438s"
+                     data-program="P02"
+                     data-turn="1"
+                     title="P2_1">
+                    P2_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 5240.4px; width: 101.4px;"
+                     data-rid="P08_T0"
+                     data-arrival="0.274"
+                     data-start="17.471"
+                     data-finish="17.809"
+                     data-hit="L0"
+                     data-queue-wait="17197.2ms"
+                     data-inference="0.338s"
+                     data-program="P08"
+                     data-turn="0"
+                     title="P8_0">
+                    P8_0
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 5341.8px; width: 191.4px;"
+                     data-rid="P03_T3"
+                     data-arrival="17.533"
+                     data-start="17.809"
+                     data-finish="18.447"
+                     data-hit="TTL"
+                     data-queue-wait="276.0ms"
+                     data-inference="0.638s"
+                     data-program="P03"
+                     data-turn="3"
+                     title="P3_3">
+                    P3_3
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 5533.2px; width: 161.4px;"
+                     data-rid="P02_T2"
+                     data-arrival="17.971"
+                     data-start="18.447"
+                     data-finish="18.985"
+                     data-hit="TTL"
+                     data-queue-wait="476.0ms"
+                     data-inference="0.538s"
+                     data-program="P02"
+                     data-turn="2"
+                     title="P2_2">
+                    P2_2
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 5694.6px; width: 221.4px;"
+                     data-rid="P03_T4"
+                     data-arrival="18.947"
+                     data-start="18.985"
+                     data-finish="19.723"
+                     data-hit="L0"
+                     data-queue-wait="38.0ms"
+                     data-inference="0.738s"
+                     data-program="P03"
+                     data-turn="4"
+                     title="P3_4">
+                    P3_4
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 5916.0px; width: 191.4px;"
+                     data-rid="P02_T3"
+                     data-arrival="19.485"
+                     data-start="19.723"
+                     data-finish="20.361"
+                     data-hit="L0"
+                     data-queue-wait="238.0ms"
+                     data-inference="0.638s"
+                     data-program="P02"
+                     data-turn="3"
+                     title="P2_3">
+                    P2_3
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 6107.4px; width: 131.4px;"
+                     data-rid="P08_T1"
+                     data-arrival="18.309"
+                     data-start="20.361"
+                     data-finish="20.799"
+                     data-hit="TTL"
+                     data-queue-wait="2052.0ms"
+                     data-inference="0.438s"
+                     data-program="P08"
+                     data-turn="1"
+                     title="P8_1">
+                    P8_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 6238.8px; width: 101.4px;"
+                     data-rid="P11_T0"
+                     data-arrival="0.352"
+                     data-start="20.799"
+                     data-finish="21.137"
+                     data-hit="L0"
+                     data-queue-wait="20447.3ms"
+                     data-inference="0.338s"
+                     data-program="P11"
+                     data-turn="0"
+                     title="P11_0">
+                    P11_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 6340.2px; width: 101.4px;"
+                     data-rid="P15_T0"
+                     data-arrival="0.394"
+                     data-start="21.137"
+                     data-finish="21.475"
+                     data-hit="L0"
+                     data-queue-wait="20743.6ms"
+                     data-inference="0.338s"
+                     data-program="P15"
+                     data-turn="0"
+                     title="P15_0">
+                    P15_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 6441.6px; width: 161.4px;"
+                     data-rid="P08_T2"
+                     data-arrival="21.299"
+                     data-start="21.475"
+                     data-finish="22.013"
+                     data-hit="L0"
+                     data-queue-wait="176.0ms"
+                     data-inference="0.538s"
+                     data-program="P08"
+                     data-turn="2"
+                     title="P8_2">
+                    P8_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 6603.0px; width: 131.4px;"
+                     data-rid="P11_T1"
+                     data-arrival="21.637"
+                     data-start="22.013"
+                     data-finish="22.451"
+                     data-hit="TTL"
+                     data-queue-wait="376.0ms"
+                     data-inference="0.438s"
+                     data-program="P11"
+                     data-turn="1"
+                     title="P11_1">
+                    P11_1
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 6734.4px; width: 131.4px;"
+                     data-rid="P15_T1"
+                     data-arrival="21.975"
+                     data-start="22.451"
+                     data-finish="22.889"
+                     data-hit="TTL"
+                     data-queue-wait="476.0ms"
+                     data-inference="0.438s"
+                     data-program="P15"
+                     data-turn="1"
+                     title="P15_1">
+                    P15_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 6865.8px; width: 101.4px;"
+                     data-rid="P17_T0"
+                     data-arrival="0.445"
+                     data-start="22.889"
+                     data-finish="23.227"
+                     data-hit="L0"
+                     data-queue-wait="22444.4ms"
+                     data-inference="0.338s"
+                     data-program="P17"
+                     data-turn="0"
+                     title="P17_0">
+                    P17_0
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 6967.2px; width: 161.4px;"
+                     data-rid="P11_T2"
+                     data-arrival="22.951"
+                     data-start="23.227"
+                     data-finish="23.765"
+                     data-hit="TTL"
+                     data-queue-wait="276.0ms"
+                     data-inference="0.538s"
+                     data-program="P11"
+                     data-turn="2"
+                     title="P11_2">
+                    P11_2
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 7128.6px; width: 161.4px;"
+                     data-rid="P15_T2"
+                     data-arrival="23.389"
+                     data-start="23.765"
+                     data-finish="24.303"
+                     data-hit="L0"
+                     data-queue-wait="376.0ms"
+                     data-inference="0.538s"
+                     data-program="P15"
+                     data-turn="2"
+                     title="P15_2">
+                    P15_2
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 7290.0px; width: 191.4px;"
+                     data-rid="P11_T3"
+                     data-arrival="24.265"
+                     data-start="24.303"
+                     data-finish="24.941"
+                     data-hit="L0"
+                     data-queue-wait="38.0ms"
+                     data-inference="0.638s"
+                     data-program="P11"
+                     data-turn="3"
+                     title="P11_3">
+                    P11_3
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 7481.4px; width: 131.4px;"
+                     data-rid="P17_T1"
+                     data-arrival="23.727"
+                     data-start="24.941"
+                     data-finish="25.379"
+                     data-hit="TTL"
+                     data-queue-wait="1214.0ms"
+                     data-inference="0.438s"
+                     data-program="P17"
+                     data-turn="1"
+                     title="P17_1">
+                    P17_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 7612.8px; width: 101.4px;"
+                     data-rid="P00_T0"
+                     data-arrival="0.510"
+                     data-start="25.379"
+                     data-finish="25.717"
+                     data-hit="L0"
+                     data-queue-wait="24869.2ms"
+                     data-inference="0.338s"
+                     data-program="P00"
+                     data-turn="0"
+                     title="P0_0">
+                    P0_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 7714.2px; width: 101.4px;"
+                     data-rid="P14_T0"
+                     data-arrival="0.525"
+                     data-start="25.717"
+                     data-finish="26.055"
+                     data-hit="L0"
+                     data-queue-wait="25192.5ms"
+                     data-inference="0.338s"
+                     data-program="P14"
+                     data-turn="0"
+                     title="P14_0">
+                    P14_0
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 7815.6px; width: 161.4px;"
+                     data-rid="P17_T2"
+                     data-arrival="25.879"
+                     data-start="26.055"
+                     data-finish="26.593"
+                     data-hit="TTL"
+                     data-queue-wait="176.0ms"
+                     data-inference="0.538s"
+                     data-program="P17"
+                     data-turn="2"
+                     title="P17_2">
+                    P17_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 7977.0px; width: 131.4px;"
+                     data-rid="P00_T1"
+                     data-arrival="26.217"
+                     data-start="26.593"
+                     data-finish="27.031"
+                     data-hit="TTL"
+                     data-queue-wait="376.0ms"
+                     data-inference="0.438s"
+                     data-program="P00"
+                     data-turn="1"
+                     title="P0_1">
+                    P0_1
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 8108.4px; width: 131.4px;"
+                     data-rid="P14_T1"
+                     data-arrival="26.555"
+                     data-start="27.031"
+                     data-finish="27.469"
+                     data-hit="TTL"
+                     data-queue-wait="476.0ms"
+                     data-inference="0.438s"
+                     data-program="P14"
+                     data-turn="1"
+                     title="P14_1">
+                    P14_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 8239.8px; width: 191.4px;"
+                     data-rid="P17_T3"
+                     data-arrival="27.093"
+                     data-start="27.469"
+                     data-finish="28.107"
+                     data-hit="L0"
+                     data-queue-wait="376.0ms"
+                     data-inference="0.638s"
+                     data-program="P17"
+                     data-turn="3"
+                     title="P17_3">
+                    P17_3
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 8431.2px; width: 161.4px;"
+                     data-rid="P00_T2"
+                     data-arrival="27.531"
+                     data-start="28.107"
+                     data-finish="28.645"
+                     data-hit="L0"
+                     data-queue-wait="576.0ms"
+                     data-inference="0.538s"
+                     data-program="P00"
+                     data-turn="2"
+                     title="P0_2">
+                    P0_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 8592.6px; width: 161.4px;"
+                     data-rid="P14_T2"
+                     data-arrival="27.969"
+                     data-start="28.645"
+                     data-finish="29.183"
+                     data-hit="TTL"
+                     data-queue-wait="676.0ms"
+                     data-inference="0.538s"
+                     data-program="P14"
+                     data-turn="2"
+                     title="P14_2">
+                    P14_2
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 8754.0px; width: 101.4px;"
+                     data-rid="P05_T0"
+                     data-arrival="0.565"
+                     data-start="29.183"
+                     data-finish="29.521"
+                     data-hit="L0"
+                     data-queue-wait="28618.7ms"
+                     data-inference="0.338s"
+                     data-program="P05"
+                     data-turn="0"
+                     title="P5_0">
+                    P5_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 8855.4px; width: 101.4px;"
+                     data-rid="P04_T0"
+                     data-arrival="0.667"
+                     data-start="29.521"
+                     data-finish="29.859"
+                     data-hit="L0"
+                     data-queue-wait="28854.5ms"
+                     data-inference="0.338s"
+                     data-program="P04"
+                     data-turn="0"
+                     title="P4_0">
+                    P4_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 8956.8px; width: 191.4px;"
+                     data-rid="P14_T3"
+                     data-arrival="29.683"
+                     data-start="29.859"
+                     data-finish="30.497"
+                     data-hit="L0"
+                     data-queue-wait="176.0ms"
+                     data-inference="0.638s"
+                     data-program="P14"
+                     data-turn="3"
+                     title="P14_3">
+                    P14_3
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 9148.2px; width: 131.4px;"
+                     data-rid="P05_T1"
+                     data-arrival="30.021"
+                     data-start="30.497"
+                     data-finish="30.935"
+                     data-hit="TTL"
+                     data-queue-wait="476.0ms"
+                     data-inference="0.438s"
+                     data-program="P05"
+                     data-turn="1"
+                     title="P5_1">
+                    P5_1
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 9279.6px; width: 131.4px;"
+                     data-rid="P04_T1"
+                     data-arrival="30.359"
+                     data-start="30.935"
+                     data-finish="31.373"
+                     data-hit="TTL"
+                     data-queue-wait="576.0ms"
+                     data-inference="0.438s"
+                     data-program="P04"
+                     data-turn="1"
+                     title="P4_1">
+                    P4_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 9411.0px; width: 101.4px;"
+                     data-rid="P18_T0"
+                     data-arrival="0.829"
+                     data-start="31.373"
+                     data-finish="31.711"
+                     data-hit="L0"
+                     data-queue-wait="30544.4ms"
+                     data-inference="0.338s"
+                     data-program="P18"
+                     data-turn="0"
+                     title="P18_0">
+                    P18_0
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 9512.4px; width: 161.4px;"
+                     data-rid="P05_T2"
+                     data-arrival="31.435"
+                     data-start="31.711"
+                     data-finish="32.249"
+                     data-hit="L0"
+                     data-queue-wait="276.0ms"
+                     data-inference="0.538s"
+                     data-program="P05"
+                     data-turn="2"
+                     title="P5_2">
+                    P5_2
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 9673.8px; width: 161.4px;"
+                     data-rid="P04_T2"
+                     data-arrival="31.873"
+                     data-start="32.249"
+                     data-finish="32.787"
+                     data-hit="L0"
+                     data-queue-wait="376.0ms"
+                     data-inference="0.538s"
+                     data-program="P04"
+                     data-turn="2"
+                     title="P4_2">
+                    P4_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 9835.2px; width: 131.4px;"
+                     data-rid="P18_T1"
+                     data-arrival="32.211"
+                     data-start="32.787"
+                     data-finish="33.225"
+                     data-hit="TTL"
+                     data-queue-wait="576.0ms"
+                     data-inference="0.438s"
+                     data-program="P18"
+                     data-turn="1"
+                     title="P18_1">
+                    P18_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 9966.6px; width: 101.4px;"
+                     data-rid="P06_T0"
+                     data-arrival="1.114"
+                     data-start="33.225"
+                     data-finish="33.563"
+                     data-hit="L0"
+                     data-queue-wait="32111.6ms"
+                     data-inference="0.338s"
+                     data-program="P06"
+                     data-turn="0"
+                     title="P6_0">
+                    P6_0
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 10116.6px; width: 161.4px;"
+                     data-rid="P18_T2"
+                     data-arrival="33.725"
+                     data-start="33.725"
+                     data-finish="34.263"
+                     data-hit="TTL"
+                     data-queue-wait="0.0ms"
+                     data-inference="0.538s"
+                     data-program="P18"
+                     data-turn="2"
+                     title="P18_2">
+                    P18_2
+                </div>
+                <div class="request-block hit-ttl" 
+                     style="left: 10278.0px; width: 131.4px;"
+                     data-rid="P06_T1"
+                     data-arrival="34.063"
+                     data-start="34.263"
+                     data-finish="34.701"
+                     data-hit="TTL"
+                     data-queue-wait="200.0ms"
+                     data-inference="0.438s"
+                     data-program="P06"
+                     data-turn="1"
+                     title="P6_1">
+                    P6_1
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 10428.0px; width: 191.4px;"
+                     data-rid="P18_T3"
+                     data-arrival="34.763"
+                     data-start="34.763"
+                     data-finish="35.401"
+                     data-hit="L0"
+                     data-queue-wait="0.0ms"
+                     data-inference="0.638s"
+                     data-program="P18"
+                     data-turn="3"
+                     title="P18_3">
+                    P18_3
+                </div>
+                <div class="request-block hit-l0" 
+                     style="left: 10619.4px; width: 161.4px;"
+                     data-rid="P06_T2"
+                     data-arrival="35.201"
+                     data-start="35.401"
+                     data-finish="35.939"
+                     data-hit="L0"
+                     data-queue-wait="200.0ms"
+                     data-inference="0.538s"
+                     data-program="P06"
+                     data-turn="2"
+                     title="P6_2">
+                    P6_2
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Tooltip -->
+    <div class="tooltip" id="tooltip">
+        <div class="tooltip-title" id="tooltip-title">Request Details</div>
+        <div class="tooltip-row"><span class="tooltip-label">Label:</span><span class="tooltip-value" id="tt-label"></span></div>
+        <div class="tooltip-row"><span class="tooltip-label">Arrival:</span><span class="tooltip-value" id="tt-arrival"></span></div>
+        <div class="tooltip-row"><span class="tooltip-label">Start:</span><span class="tooltip-value" id="tt-start"></span></div>
+        <div class="tooltip-row"><span class="tooltip-label">Finish:</span><span class="tooltip-value" id="tt-finish"></span></div>
+        <div class="tooltip-row"><span class="tooltip-label">Duration:</span><span class="tooltip-value" id="tt-duration"></span></div>
+        <div class="tooltip-row"><span class="tooltip-label">Queue Wait:</span><span class="tooltip-value" id="tt-queue"></span></div>
+        <div class="tooltip-row"><span class="tooltip-label">Hit Type:</span><span class="tooltip-value" id="tt-hit"></span></div>
+    </div>
+    
+    <!-- Request Table (All) -->
+    <h2>All Requests ({len(sched_data)} total)</h2>
+    <div class="timeline-container">
+        <table class="stats-table">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Label</th>
+                    <th>Program</th>
+                    <th>Turn</th>
+                    <th>Arrival</th>
+                    <th>Start</th>
+                    <th>Finish</th>
+                    <th>Queue Wait</th>
+                    <th>Hit</th>
+                </tr>
+            </thead>
+            <tbody>
+
+                <tr>
+                    <td>1</td>
+                    <td><strong>P19_0</strong></td>
+                    <td>P19</td>
+                    <td>0</td>
+                    <td>0.003s</td>
+                    <td>0.003s</td>
+                    <td>0.441s</td>
+                    <td>0.0ms</td>
+                    <td><span class="legend-color hit-miss" style="width:12px;height:12px;display:inline-block;"></span> Miss</td>
+                </tr>
+
+                <tr>
+                    <td>2</td>
+                    <td><strong>P1_0</strong></td>
+                    <td>P01</td>
+                    <td>0</td>
+                    <td>0.013s</td>
+                    <td>0.441s</td>
+                    <td>0.779s</td>
+                    <td>428.6ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>3</td>
+                    <td><strong>P12_0</strong></td>
+                    <td>P12</td>
+                    <td>0</td>
+                    <td>0.013s</td>
+                    <td>0.779s</td>
+                    <td>1.117s</td>
+                    <td>765.8ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>4</td>
+                    <td><strong>P19_1</strong></td>
+                    <td>P19</td>
+                    <td>1</td>
+                    <td>0.941s</td>
+                    <td>1.117s</td>
+                    <td>1.555s</td>
+                    <td>176.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>5</td>
+                    <td><strong>P1_1</strong></td>
+                    <td>P01</td>
+                    <td>1</td>
+                    <td>1.279s</td>
+                    <td>1.555s</td>
+                    <td>1.993s</td>
+                    <td>276.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>6</td>
+                    <td><strong>P12_1</strong></td>
+                    <td>P12</td>
+                    <td>1</td>
+                    <td>1.617s</td>
+                    <td>1.993s</td>
+                    <td>2.431s</td>
+                    <td>376.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>7</td>
+                    <td><strong>P19_2</strong></td>
+                    <td>P19</td>
+                    <td>2</td>
+                    <td>2.055s</td>
+                    <td>2.431s</td>
+                    <td>2.969s</td>
+                    <td>376.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>8</td>
+                    <td><strong>P1_2</strong></td>
+                    <td>P01</td>
+                    <td>2</td>
+                    <td>2.493s</td>
+                    <td>2.969s</td>
+                    <td>3.507s</td>
+                    <td>476.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>9</td>
+                    <td><strong>P12_2</strong></td>
+                    <td>P12</td>
+                    <td>2</td>
+                    <td>2.931s</td>
+                    <td>3.507s</td>
+                    <td>4.045s</td>
+                    <td>576.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>10</td>
+                    <td><strong>P1_3</strong></td>
+                    <td>P01</td>
+                    <td>3</td>
+                    <td>4.007s</td>
+                    <td>4.045s</td>
+                    <td>4.683s</td>
+                    <td>38.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>11</td>
+                    <td><strong>P9_0</strong></td>
+                    <td>P09</td>
+                    <td>0</td>
+                    <td>0.015s</td>
+                    <td>4.683s</td>
+                    <td>5.021s</td>
+                    <td>4668.1ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>12</td>
+                    <td><strong>P7_0</strong></td>
+                    <td>P07</td>
+                    <td>0</td>
+                    <td>0.045s</td>
+                    <td>5.021s</td>
+                    <td>5.359s</td>
+                    <td>4975.8ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>13</td>
+                    <td><strong>P1_4</strong></td>
+                    <td>P01</td>
+                    <td>4</td>
+                    <td>5.183s</td>
+                    <td>5.359s</td>
+                    <td>6.097s</td>
+                    <td>176.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>14</td>
+                    <td><strong>P9_1</strong></td>
+                    <td>P09</td>
+                    <td>1</td>
+                    <td>5.521s</td>
+                    <td>6.097s</td>
+                    <td>6.535s</td>
+                    <td>576.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>15</td>
+                    <td><strong>P7_1</strong></td>
+                    <td>P07</td>
+                    <td>1</td>
+                    <td>5.859s</td>
+                    <td>6.535s</td>
+                    <td>6.973s</td>
+                    <td>676.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>16</td>
+                    <td><strong>P13_0</strong></td>
+                    <td>P13</td>
+                    <td>0</td>
+                    <td>0.111s</td>
+                    <td>6.973s</td>
+                    <td>7.311s</td>
+                    <td>6862.4ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>17</td>
+                    <td><strong>P9_2</strong></td>
+                    <td>P09</td>
+                    <td>2</td>
+                    <td>7.035s</td>
+                    <td>7.311s</td>
+                    <td>7.849s</td>
+                    <td>276.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>18</td>
+                    <td><strong>P7_2</strong></td>
+                    <td>P07</td>
+                    <td>2</td>
+                    <td>7.473s</td>
+                    <td>7.849s</td>
+                    <td>8.387s</td>
+                    <td>376.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>19</td>
+                    <td><strong>P9_3</strong></td>
+                    <td>P09</td>
+                    <td>3</td>
+                    <td>8.349s</td>
+                    <td>8.387s</td>
+                    <td>9.025s</td>
+                    <td>38.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>20</td>
+                    <td><strong>P7_3</strong></td>
+                    <td>P07</td>
+                    <td>3</td>
+                    <td>8.887s</td>
+                    <td>9.025s</td>
+                    <td>9.663s</td>
+                    <td>138.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>21</td>
+                    <td><strong>P9_4</strong></td>
+                    <td>P09</td>
+                    <td>4</td>
+                    <td>9.525s</td>
+                    <td>9.663s</td>
+                    <td>10.401s</td>
+                    <td>138.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>22</td>
+                    <td><strong>P7_4</strong></td>
+                    <td>P07</td>
+                    <td>4</td>
+                    <td>10.163s</td>
+                    <td>10.401s</td>
+                    <td>11.139s</td>
+                    <td>238.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>23</td>
+                    <td><strong>P13_1</strong></td>
+                    <td>P13</td>
+                    <td>1</td>
+                    <td>7.811s</td>
+                    <td>11.139s</td>
+                    <td>11.577s</td>
+                    <td>3328.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>24</td>
+                    <td><strong>P10_0</strong></td>
+                    <td>P10</td>
+                    <td>0</td>
+                    <td>0.123s</td>
+                    <td>11.577s</td>
+                    <td>11.915s</td>
+                    <td>11453.9ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>25</td>
+                    <td><strong>P16_0</strong></td>
+                    <td>P16</td>
+                    <td>0</td>
+                    <td>0.125s</td>
+                    <td>11.915s</td>
+                    <td>12.253s</td>
+                    <td>11790.7ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>26</td>
+                    <td><strong>P13_2</strong></td>
+                    <td>P13</td>
+                    <td>2</td>
+                    <td>12.077s</td>
+                    <td>12.253s</td>
+                    <td>12.791s</td>
+                    <td>176.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>27</td>
+                    <td><strong>P10_1</strong></td>
+                    <td>P10</td>
+                    <td>1</td>
+                    <td>12.415s</td>
+                    <td>12.791s</td>
+                    <td>13.229s</td>
+                    <td>376.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>28</td>
+                    <td><strong>P16_1</strong></td>
+                    <td>P16</td>
+                    <td>1</td>
+                    <td>12.753s</td>
+                    <td>13.229s</td>
+                    <td>13.667s</td>
+                    <td>476.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>29</td>
+                    <td><strong>P3_0</strong></td>
+                    <td>P03</td>
+                    <td>0</td>
+                    <td>0.126s</td>
+                    <td>13.667s</td>
+                    <td>14.005s</td>
+                    <td>13541.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>30</td>
+                    <td><strong>P10_2</strong></td>
+                    <td>P10</td>
+                    <td>2</td>
+                    <td>13.729s</td>
+                    <td>14.005s</td>
+                    <td>14.543s</td>
+                    <td>276.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>31</td>
+                    <td><strong>P16_2</strong></td>
+                    <td>P16</td>
+                    <td>2</td>
+                    <td>14.167s</td>
+                    <td>14.543s</td>
+                    <td>15.081s</td>
+                    <td>376.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>32</td>
+                    <td><strong>P3_1</strong></td>
+                    <td>P03</td>
+                    <td>1</td>
+                    <td>14.505s</td>
+                    <td>15.081s</td>
+                    <td>15.519s</td>
+                    <td>576.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>33</td>
+                    <td><strong>P2_0</strong></td>
+                    <td>P02</td>
+                    <td>0</td>
+                    <td>0.161s</td>
+                    <td>15.519s</td>
+                    <td>15.857s</td>
+                    <td>15358.4ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>34</td>
+                    <td><strong>P16_3</strong></td>
+                    <td>P16</td>
+                    <td>3</td>
+                    <td>15.581s</td>
+                    <td>15.857s</td>
+                    <td>16.495s</td>
+                    <td>276.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>35</td>
+                    <td><strong>P3_2</strong></td>
+                    <td>P03</td>
+                    <td>2</td>
+                    <td>16.019s</td>
+                    <td>16.495s</td>
+                    <td>17.033s</td>
+                    <td>476.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>36</td>
+                    <td><strong>P2_1</strong></td>
+                    <td>P02</td>
+                    <td>1</td>
+                    <td>16.357s</td>
+                    <td>17.033s</td>
+                    <td>17.471s</td>
+                    <td>676.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>37</td>
+                    <td><strong>P8_0</strong></td>
+                    <td>P08</td>
+                    <td>0</td>
+                    <td>0.274s</td>
+                    <td>17.471s</td>
+                    <td>17.809s</td>
+                    <td>17197.2ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>38</td>
+                    <td><strong>P3_3</strong></td>
+                    <td>P03</td>
+                    <td>3</td>
+                    <td>17.533s</td>
+                    <td>17.809s</td>
+                    <td>18.447s</td>
+                    <td>276.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>39</td>
+                    <td><strong>P2_2</strong></td>
+                    <td>P02</td>
+                    <td>2</td>
+                    <td>17.971s</td>
+                    <td>18.447s</td>
+                    <td>18.985s</td>
+                    <td>476.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>40</td>
+                    <td><strong>P3_4</strong></td>
+                    <td>P03</td>
+                    <td>4</td>
+                    <td>18.947s</td>
+                    <td>18.985s</td>
+                    <td>19.723s</td>
+                    <td>38.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>41</td>
+                    <td><strong>P2_3</strong></td>
+                    <td>P02</td>
+                    <td>3</td>
+                    <td>19.485s</td>
+                    <td>19.723s</td>
+                    <td>20.361s</td>
+                    <td>238.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>42</td>
+                    <td><strong>P8_1</strong></td>
+                    <td>P08</td>
+                    <td>1</td>
+                    <td>18.309s</td>
+                    <td>20.361s</td>
+                    <td>20.799s</td>
+                    <td>2052.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>43</td>
+                    <td><strong>P11_0</strong></td>
+                    <td>P11</td>
+                    <td>0</td>
+                    <td>0.352s</td>
+                    <td>20.799s</td>
+                    <td>21.137s</td>
+                    <td>20447.3ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>44</td>
+                    <td><strong>P15_0</strong></td>
+                    <td>P15</td>
+                    <td>0</td>
+                    <td>0.394s</td>
+                    <td>21.137s</td>
+                    <td>21.475s</td>
+                    <td>20743.6ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>45</td>
+                    <td><strong>P8_2</strong></td>
+                    <td>P08</td>
+                    <td>2</td>
+                    <td>21.299s</td>
+                    <td>21.475s</td>
+                    <td>22.013s</td>
+                    <td>176.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>46</td>
+                    <td><strong>P11_1</strong></td>
+                    <td>P11</td>
+                    <td>1</td>
+                    <td>21.637s</td>
+                    <td>22.013s</td>
+                    <td>22.451s</td>
+                    <td>376.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>47</td>
+                    <td><strong>P15_1</strong></td>
+                    <td>P15</td>
+                    <td>1</td>
+                    <td>21.975s</td>
+                    <td>22.451s</td>
+                    <td>22.889s</td>
+                    <td>476.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>48</td>
+                    <td><strong>P17_0</strong></td>
+                    <td>P17</td>
+                    <td>0</td>
+                    <td>0.445s</td>
+                    <td>22.889s</td>
+                    <td>23.227s</td>
+                    <td>22444.4ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>49</td>
+                    <td><strong>P11_2</strong></td>
+                    <td>P11</td>
+                    <td>2</td>
+                    <td>22.951s</td>
+                    <td>23.227s</td>
+                    <td>23.765s</td>
+                    <td>276.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>50</td>
+                    <td><strong>P15_2</strong></td>
+                    <td>P15</td>
+                    <td>2</td>
+                    <td>23.389s</td>
+                    <td>23.765s</td>
+                    <td>24.303s</td>
+                    <td>376.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>51</td>
+                    <td><strong>P11_3</strong></td>
+                    <td>P11</td>
+                    <td>3</td>
+                    <td>24.265s</td>
+                    <td>24.303s</td>
+                    <td>24.941s</td>
+                    <td>38.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>52</td>
+                    <td><strong>P17_1</strong></td>
+                    <td>P17</td>
+                    <td>1</td>
+                    <td>23.727s</td>
+                    <td>24.941s</td>
+                    <td>25.379s</td>
+                    <td>1214.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>53</td>
+                    <td><strong>P0_0</strong></td>
+                    <td>P00</td>
+                    <td>0</td>
+                    <td>0.510s</td>
+                    <td>25.379s</td>
+                    <td>25.717s</td>
+                    <td>24869.2ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>54</td>
+                    <td><strong>P14_0</strong></td>
+                    <td>P14</td>
+                    <td>0</td>
+                    <td>0.525s</td>
+                    <td>25.717s</td>
+                    <td>26.055s</td>
+                    <td>25192.5ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>55</td>
+                    <td><strong>P17_2</strong></td>
+                    <td>P17</td>
+                    <td>2</td>
+                    <td>25.879s</td>
+                    <td>26.055s</td>
+                    <td>26.593s</td>
+                    <td>176.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>56</td>
+                    <td><strong>P0_1</strong></td>
+                    <td>P00</td>
+                    <td>1</td>
+                    <td>26.217s</td>
+                    <td>26.593s</td>
+                    <td>27.031s</td>
+                    <td>376.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>57</td>
+                    <td><strong>P14_1</strong></td>
+                    <td>P14</td>
+                    <td>1</td>
+                    <td>26.555s</td>
+                    <td>27.031s</td>
+                    <td>27.469s</td>
+                    <td>476.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>58</td>
+                    <td><strong>P17_3</strong></td>
+                    <td>P17</td>
+                    <td>3</td>
+                    <td>27.093s</td>
+                    <td>27.469s</td>
+                    <td>28.107s</td>
+                    <td>376.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>59</td>
+                    <td><strong>P0_2</strong></td>
+                    <td>P00</td>
+                    <td>2</td>
+                    <td>27.531s</td>
+                    <td>28.107s</td>
+                    <td>28.645s</td>
+                    <td>576.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>60</td>
+                    <td><strong>P14_2</strong></td>
+                    <td>P14</td>
+                    <td>2</td>
+                    <td>27.969s</td>
+                    <td>28.645s</td>
+                    <td>29.183s</td>
+                    <td>676.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>61</td>
+                    <td><strong>P5_0</strong></td>
+                    <td>P05</td>
+                    <td>0</td>
+                    <td>0.565s</td>
+                    <td>29.183s</td>
+                    <td>29.521s</td>
+                    <td>28618.7ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>62</td>
+                    <td><strong>P4_0</strong></td>
+                    <td>P04</td>
+                    <td>0</td>
+                    <td>0.667s</td>
+                    <td>29.521s</td>
+                    <td>29.859s</td>
+                    <td>28854.5ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>63</td>
+                    <td><strong>P14_3</strong></td>
+                    <td>P14</td>
+                    <td>3</td>
+                    <td>29.683s</td>
+                    <td>29.859s</td>
+                    <td>30.497s</td>
+                    <td>176.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>64</td>
+                    <td><strong>P5_1</strong></td>
+                    <td>P05</td>
+                    <td>1</td>
+                    <td>30.021s</td>
+                    <td>30.497s</td>
+                    <td>30.935s</td>
+                    <td>476.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>65</td>
+                    <td><strong>P4_1</strong></td>
+                    <td>P04</td>
+                    <td>1</td>
+                    <td>30.359s</td>
+                    <td>30.935s</td>
+                    <td>31.373s</td>
+                    <td>576.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>66</td>
+                    <td><strong>P18_0</strong></td>
+                    <td>P18</td>
+                    <td>0</td>
+                    <td>0.829s</td>
+                    <td>31.373s</td>
+                    <td>31.711s</td>
+                    <td>30544.4ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>67</td>
+                    <td><strong>P5_2</strong></td>
+                    <td>P05</td>
+                    <td>2</td>
+                    <td>31.435s</td>
+                    <td>31.711s</td>
+                    <td>32.249s</td>
+                    <td>276.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>68</td>
+                    <td><strong>P4_2</strong></td>
+                    <td>P04</td>
+                    <td>2</td>
+                    <td>31.873s</td>
+                    <td>32.249s</td>
+                    <td>32.787s</td>
+                    <td>376.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>69</td>
+                    <td><strong>P18_1</strong></td>
+                    <td>P18</td>
+                    <td>1</td>
+                    <td>32.211s</td>
+                    <td>32.787s</td>
+                    <td>33.225s</td>
+                    <td>576.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>70</td>
+                    <td><strong>P6_0</strong></td>
+                    <td>P06</td>
+                    <td>0</td>
+                    <td>1.114s</td>
+                    <td>33.225s</td>
+                    <td>33.563s</td>
+                    <td>32111.6ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>71</td>
+                    <td><strong>P18_2</strong></td>
+                    <td>P18</td>
+                    <td>2</td>
+                    <td>33.725s</td>
+                    <td>33.725s</td>
+                    <td>34.263s</td>
+                    <td>0.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>72</td>
+                    <td><strong>P6_1</strong></td>
+                    <td>P06</td>
+                    <td>1</td>
+                    <td>34.063s</td>
+                    <td>34.263s</td>
+                    <td>34.701s</td>
+                    <td>200.0ms</td>
+                    <td><span class="legend-color hit-ttl" style="width:12px;height:12px;display:inline-block;"></span> TTL</td>
+                </tr>
+
+                <tr>
+                    <td>73</td>
+                    <td><strong>P18_3</strong></td>
+                    <td>P18</td>
+                    <td>3</td>
+                    <td>34.763s</td>
+                    <td>34.763s</td>
+                    <td>35.401s</td>
+                    <td>0.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+
+                <tr>
+                    <td>74</td>
+                    <td><strong>P6_2</strong></td>
+                    <td>P06</td>
+                    <td>2</td>
+                    <td>35.201s</td>
+                    <td>35.401s</td>
+                    <td>35.939s</td>
+                    <td>200.0ms</td>
+                    <td><span class="legend-color hit-l0" style="width:12px;height:12px;display:inline-block;"></span> L0</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+    
+    <script>
+        // Tooltip functionality
+        const tooltip = document.getElementById('tooltip');
+        const blocks = document.querySelectorAll('.request-block');
+        
+        blocks.forEach(block => {
+            block.addEventListener('mouseenter', (e) => {
+                const data = block.dataset;
+                document.getElementById('tt-label').textContent = block.textContent.trim();
+                document.getElementById('tt-arrival').textContent = data.arrival + 's';
+                document.getElementById('tt-start').textContent = data.start + 's';
+                document.getElementById('tt-finish').textContent = data.finish + 's';
+                document.getElementById('tt-duration').textContent = data.inference;
+                document.getElementById('tt-queue').textContent = data.queueWait;
+                document.getElementById('tt-hit').textContent = data.hit;
+                document.getElementById('tooltip-title').textContent = 'Request: ' + data.rid;
+                tooltip.classList.add('show');
+            });
+            
+            block.addEventListener('mousemove', (e) => {
+                tooltip.style.left = (e.clientX + 15) + 'px';
+                tooltip.style.top = (e.clientY + 15) + 'px';
+            });
+            
+            block.addEventListener('mouseleave', () => {
+                tooltip.classList.remove('show');
+            });
+        });
+        
+        // Auto-scroll to start
+        document.querySelector('.timeline-container').scrollLeft = 0;
+    </script>
+</body>
+</html>
