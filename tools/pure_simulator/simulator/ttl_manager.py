@@ -5,6 +5,7 @@ TTLManager: Manages Time-To-Live based pinning for Continuum KV cache protection
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import statistics
+import os
 
 from .tree_node import TreeNode
 from .radix_tree import RadixTree
@@ -78,16 +79,14 @@ class TTLManager:
         radix_tree: RadixTree,
         default_ttl: float = 5.0,
         min_ttl: float = 0.5,
-        max_ttl: float = 15.0,
-        history_threshold: int = 1,  # Start adaptive TTL immediately (tool intervals are fixed)
+        max_ttl: float = 120.0,  # Aligned with SimulatorConfig (论文允许较长TTL保护长工具调用)
+        history_threshold: int = 100,  # K=100 per Continuum paper cold-start threshold
         enable_adaptive_ttl: bool = True,
-        ttl_grid_min: float = 1.0,
-        ttl_grid_max: float = 60.0,
         ttl_grid_points: int = 50,
         prefill_latency_ms_per_token: float = 0.01,
         # L1 cache parameters
         l1_reload_penalty: float = 0.3,  # L1 loading time as fraction of prefill time
-        write_policy: str = "write_through",  # "write_back" or "write_through"
+        write_policy: str = "write_back",  # "write_back" or "write_through" (论文推荐write_back)
         high_pressure_threshold: float = 0.8,  # Memory pressure threshold to disable TTL
     ):
         self.radix_tree = radix_tree
@@ -97,9 +96,7 @@ class TTLManager:
         self.history_threshold = history_threshold
         self.enable_adaptive_ttl = enable_adaptive_ttl
 
-        # CDF grid search parameters
-        self.ttl_grid_min = ttl_grid_min
-        self.ttl_grid_max = ttl_grid_max
+        # Grid search parameters: use min_ttl/max_ttl as grid bounds
         self.ttl_grid_points = ttl_grid_points
 
         # Hardware parameters for utility calculation
@@ -119,6 +116,9 @@ class TTLManager:
         self.global_tool_durations: Dict[str, List[float]] = {}
         self.global_idle_gaps: List[float] = []
         self.memoryfulness_factor: float = 1.0
+
+        # Track TTL values used for adaptive TTL
+        self.adaptive_ttl_history: List[Tuple[str, float, str]] = []  # (program_id, ttl, strategy)
     
     def pin_program(
         self,
@@ -207,30 +207,33 @@ class TTLManager:
         return True
     
     def cleanup_expired(self, current_time: float) -> List[str]:
-        expired = []
+        expired_programs = []
         
         for key, entry in list(self.pinned_entries.items()):
             if current_time >= entry.expire_time:
-                expired.append(key[0] if isinstance(key, tuple) else key)
+                # Extract program_id from key (key may be tuple or string)
+                if isinstance(key, tuple):
+                    prog_id = key[0]
+                else:
+                    prog_id = key
+                if prog_id not in expired_programs:
+                    expired_programs.append(prog_id)
         
-        for key in expired:
-            if isinstance(key, tuple):
-                self.unpin_program(key[0], current_time, key[1])
-            else:
-                self.unpin_program(key, current_time)
+        for prog_id in expired_programs:
+            self.unpin_program(prog_id, current_time)
             self.stats.expired_pins += 1
         
         # Also clean up radix tree nodes with TTL expiry times
         self.radix_tree.cleanup_expired_ttls(current_time)
         
-        return expired
+        return expired_programs
     
     def is_pinned(self, program_id: str, current_time: float = None) -> bool:
         """Check if program is currently pinned (and not expired)."""
         # Find any entry for this program
         matching_keys = [k for k in self.pinned_entries.keys() 
                        if (isinstance(k, tuple) and k[0] == program_id) or k == program_id]
-        
+
         if not matching_keys:
             return False
         
@@ -394,15 +397,21 @@ class TTLManager:
         turn_index: int,
         total_turns: int,
         current_time: float,
+        l2_enabled: bool = False,
+        l2_reload_penalty: float = None,
     ) -> Tuple[float, str]:
         """Calculate optimal TTL using paper's utility model with L1 penalty.
 
         τ* = argmax_τ  P(τ, f) × (T·η + Prefill-Reload(r)) - (MemUsage(r)/M) × τ
 
-        Extended to consider L1 penalty and write policy:
+        Extended to consider L1 penalty, L2 state, and write policy:
         - TTL + write_back: Protect node in L0, no spill
         - TTL + write_through: Protect node, but spill if evicted
         - no_ttl: Don't pin, always L0 miss
+
+        L2-aware cost model (per paper Section 4.1.3):
+        - Without L2: Prefill-Reload = prefill cost (full recomputation)
+        - With L2: Prefill-Reload = L2 reload cost (typically smaller than prefill)
 
         Args:
             program_id: The program ID
@@ -412,6 +421,9 @@ class TTLManager:
             turn_index: Current turn index (0-based)
             total_turns: Total turns in this program
             current_time: Current simulation time
+            l2_enabled: Whether L2 cache is enabled (affects cost model)
+            l2_reload_penalty: L2 reload cost as fraction of prefill cost.
+                              If None, uses self.l1_reload_penalty.
 
         Returns:
             (ttl_seconds, strategy_name)
@@ -422,7 +434,21 @@ class TTLManager:
         # 1. Calculate base parameters
         T = self._calculate_T()
         eta = self._calculate_memoryfulness(turn_index, total_turns)
-        prefill_reload = miss_tokens * (self.prefill_latency_ms_per_token / 1000.0)
+
+        # Calculate prefill cost (seconds)
+        prefill_cost = miss_tokens * (self.prefill_latency_ms_per_token / 1000.0)
+
+        # L2-aware cost model: Prefill vs Reload
+        # - Without L2: Miss = full prefill (Prefill-Reload = prefill_cost)
+        # - With L2: Miss = L2 reload cost (typically < prefill)
+        # Use l2_reload_penalty as multiplier on prefill cost
+        if l2_enabled:
+            reload_cost_penalty = l2_reload_penalty if l2_reload_penalty is not None else self.l1_reload_penalty
+            reload_cost = prefill_cost * reload_cost_penalty
+        else:
+            # Without L2, reload cost = prefill cost (no offloading available)
+            reload_cost = prefill_cost
+
         mem_usage = node_size / max(self.radix_tree.allocator.capacity, 1)
 
         # 2. Get CDF durations
@@ -433,10 +459,11 @@ class TTLManager:
         used = self.radix_tree.allocator.used()
         memory_pressure = used / capacity if capacity > 0 else 0.0
 
-        # 4. Use strategy comparison
+        # 4. Use strategy comparison with L2-aware costs
         if cdf_durations:
             best_ttl, best_strategy = self._compare_strategies(
-                miss_tokens, node_size, T, eta, prefill_reload, cdf_durations, memory_pressure
+                miss_tokens, node_size, T, eta, prefill_cost, reload_cost,
+                cdf_durations, memory_pressure, l2_enabled
             )
 
             # Apply memory pressure adjustment to TTL
@@ -445,14 +472,22 @@ class TTLManager:
             # Enforce bounds
             best_ttl = max(self.min_ttl, min(self.max_ttl, best_ttl))
 
+            # Track adaptive TTL history
+            self.adaptive_ttl_history.append((program_id, best_ttl, best_strategy))
+
             return best_ttl, best_strategy
 
+        # Track default TTL usage
+        self.adaptive_ttl_history.append((program_id, self.default_ttl, "default"))
         return self.default_ttl, "default"
 
     def _calculate_T(self) -> float:
         """T: Unit memory average queueing delay (ms per token).
 
         Based on idle gaps between requests.
+        Returns queueing delay per unit of memory usage.
+
+        Per Continuum paper: T initialized to 0 for cold-start.
         """
         if self.global_idle_gaps:
             try:
@@ -464,20 +499,30 @@ class TTLManager:
                     return avg_gap_ms / max(avg_usage, 0.01)
             except statistics.StatisticsError:
                 pass
-        return self.default_ttl * 500  # Fallback: default TTL in ms
+        # Fallback: return 0 per paper (论文规定T初始化为0)
+        return 0.0
 
     def _calculate_memoryfulness(self, turn_index: int, total_turns: int) -> float:
         """η: Memoryfulness factor = -Corr(k, N-k).
 
+        Paper definition: η measures the negative correlation between current progress
+        and remaining work. Higher η means more benefit from preserving order.
+
         - Earlier turns (smaller turn_index) need more protection → higher η
         - Later turns have less remaining work → lower η
+
+        Simplified approximation for simulation:
+        - η ≈ remaining_turns / total_turns
+        - Range: 1.0 (first turn) → ~0.0 (last turn)
         """
         if total_turns <= 1:
             return 1.0
-        # Linear decay: η = 1 - (turn / (total-1)) * 0.8
-        # Range: 1.0 (first turn) to 0.2 (last turn)
-        decay = (turn_index / max(total_turns - 1, 1)) * 0.8
-        return max(0.1, 1.0 - decay)
+        # Simplified formula: η = (remaining turns) / (total turns - 1)
+        # This gives η = 1.0 for first turn, η → 0 for last turn
+        remaining = total_turns - turn_index
+        decay = turn_index / max(total_turns - 1, 1)
+        # Range: 0.05 → 1.0 (never quite reach 0 to ensure some protection)
+        return max(0.05, 1.0 - decay * 0.95)
 
     def _apply_memory_pressure(self, ttl: float) -> float:
         """Apply memory pressure penalty when cache is highly utilized.
@@ -527,74 +572,100 @@ class TTLManager:
         node_size: int,
         T: float,
         eta: float,
-        prefill_reload: float,
+        prefill_cost: float,
+        reload_cost: float,
         cdf_durations: List[float],
         memory_pressure: float = 0.0,
+        l2_enabled: bool = False,
     ) -> Tuple[float, str]:
         """
-        Compare TTL vs no-TTL strategies.
+        Compare TTL vs no-TTL strategies using paper's utility model.
 
-        Simplified utility model:
-        - Benefit = P(hit) × prefill_savings + L1_reload_avoidance
-        - Cost = memory_holding_cost × τ
+        Paper formula (Section 4.1.3):
+            τ* = argmax_τ  P(τ, f) × (T·η + Prefill-Reload(r)) - (MemUsage(r)/M) × τ
 
         Where:
-        - P(hit) = CDF(tool_time) = probability tool finishes within TTL
-        - prefill_savings = miss_tokens × prefill_latency (what we save on hit)
-        - L1_reload_avoidance = P(evicted) × L1_reload_penalty × prefill_cost
-        - memory_holding_cost = (node_size / capacity) × base_cost_per_sec
+        - P(τ, f) = CDF(tool_time) = probability tool finishes within TTL
+        - T·η = queueing delay savings (T = unit queueing delay, η = memoryfulness)
+        - Prefill-Reload(r) = cost saved on cache hit
+          * Without L2: = prefill_cost (full recomputation)
+          * With L2: = reload_cost (L2 load-back, typically faster)
+        - (MemUsage(r)/M) × τ = memory holding cost
+
+        L2-aware model:
+        - L2 disabled: Prefill-Reload = prefill_cost
+        - L2 enabled: Prefill-Reload = reload_cost (L2 reload is faster than prefill)
         """
         if not cdf_durations:
             return self.default_ttl, "default"
 
         capacity = self.radix_tree.allocator.capacity
 
-        # Calculate prefill cost in ms
-        prefill_cost = prefill_reload * 1000  # Convert to ms
+        # Calculate costs in ms
+        prefill_cost_ms = prefill_cost * 1000
+        reload_cost_ms = reload_cost * 1000
 
-        # Calculate memory cost per second (in ms)
-        # This is the opportunity cost of holding node_size tokens in memory
-        # Base cost: 1ms per second per 1% memory usage (much lower than before)
+        # Per paper: Prefill-Reload depends on L2 state
+        # - Without L2: Prefill-Reload = prefill_cost (miss = full recompute)
+        # - With L2: Prefill-Reload = reload_cost (miss = L2 load-back, faster)
+        if l2_enabled:
+            prefill_reload = reload_cost_ms
+        else:
+            prefill_reload = prefill_cost_ms
+
+        # Calculate memory holding cost per second (in ms)
+        # Per paper: Cost = (MemUsage(r)/M) × τ
+        # Here we express it as: cost_per_sec_ms × τ
+        # where cost_per_sec_ms represents the opportunity cost per second
         mem_usage = node_size / max(capacity, 1)
-        cost_per_sec_ms = mem_usage * 10  # 10ms per second per 100% memory usage
+        cost_per_sec_ms = mem_usage * 10  # ms per second per unit memory usage
 
-        # Strategy 1: no TTL (baseline)
+        # No-TTL strategy: always miss, pay reload/prefill cost
+        # But we don't add this to optimization - TTL is only better if positive
         utility_no_ttl = 0.0
 
-        # Strategy 2: TTL with grid search
+        # Paper Section 4.1.4: "枚举 S[f] 中所有唯一的工具调用时长作为候选（包括 τ=0）"
+        # Use unique historical duration values as τ candidates
+        tau_candidates = self._generate_tau_grid(cdf_durations)
+
+        # TTL strategy: grid search over τ values
         best_ttl = 0.0
         best_value = utility_no_ttl
         best_strategy = "no_ttl"
 
-        for tau in self._generate_tau_grid():
+        for tau in tau_candidates:
             # P(τ, f): CDF value at τ - probability tool finishes within τ
             P_tau = self._compute_cdf(cdf_durations, tau)
 
-            # Benefit 1: Prefill savings on cache hit
-            # If tool finishes within TTL, we get a cache hit and save prefill time
-            prefill_savings = prefill_cost
-            benefit1 = P_tau * prefill_savings
+            # Per paper formula:
+            # Benefit = P(τ,f) × (T·η + Prefill-Reload)
+            #
+            # Component 1: Queueing delay savings
+            # When tool finishes within TTL, we get cache hit and save queueing delay
+            queue_delay_savings = T * eta
+            benefit_queue = P_tau * queue_delay_savings
 
-            # Benefit 2: L1 reload avoidance
-            # If TTL protects node from eviction, we avoid L1 reload penalty
-            # P(evicted) ≈ memory_pressure (fraction of nodes likely to be evicted)
-            memory_pressure = self.radix_tree.allocator.used() / max(capacity, 1)
-            eviction_prob = min(1.0, memory_pressure)
-            l1_reload_avoidance = eviction_prob * self.l1_reload_penalty * prefill_cost
-            benefit2 = P_tau * l1_reload_avoidance
+            # Component 2: Prefill/Reload savings
+            # If tool finishes within TTL, we get cache hit and save computation
+            # Per paper: Prefill-Reload is the cost we save (depends on L2 state)
+            benefit_prefill_reload = P_tau * prefill_reload
 
-            # Total benefit
-            benefit = benefit1 + benefit2
+            # Total benefit per paper formula
+            benefit = benefit_queue + benefit_prefill_reload
 
-            # Cost = memory_holding_cost × τ
+            # Cost = memory holding cost × τ
+            # Per paper: Cost = (MemUsage(r)/M) × τ
             cost = cost_per_sec_ms * tau
 
             # TTL + write_back utility
             utility_ttl_wb = benefit - cost
 
             # TTL + write_through utility
-            # When evicted, we pay L1 reload penalty
-            miss_penalty = (1 - P_tau) * self.l1_reload_penalty * prefill_cost * eviction_prob
+            # When evicted during TTL, we pay reload penalty
+            # P(evicted) ≈ eviction_prob
+            eviction_prob = self.radix_tree.allocator.used() / max(capacity, 1)
+            eviction_prob = min(1.0, eviction_prob)
+            miss_penalty = (1 - P_tau) * eviction_prob * prefill_reload
             utility_ttl_wt = benefit - cost - miss_penalty
 
             # Compare utilities
@@ -630,12 +701,23 @@ class TTLManager:
         Returns:
             (durations_list, strategy_name)
         """
+        # Debug: log the lookup
+        debug = os.environ.get('DEBUG_CDF', '0') == '1'
+        if debug:
+            print(f"[CDF DEBUG] program={program_id}, tool={tool_name}")
+            print(f"  program_stats keys: {list(self.program_stats.keys())[:5]}")
+            if program_id in self.program_stats:
+                print(f"  program_tools: {list(self.program_stats[program_id].tool_durations.keys())}")
+            print(f"  global_tool_durations keys: {list(self.global_tool_durations.keys())}")
+
         # Try program-specific tool durations first
         if program_id in self.program_stats:
             prog_stats = self.program_stats[program_id]
             if tool_name and tool_name in prog_stats.tool_durations:
                 durations = prog_stats.tool_durations[tool_name].durations
                 if len(durations) >= self.history_threshold:
+                    if debug:
+                        print(f"  -> program_tool:{tool_name}, {len(durations)} samples")
                     return durations, f"program_tool:{tool_name}"
 
         # Try program-specific all tools
@@ -645,12 +727,16 @@ class TTLManager:
             for tool_stat in prog_stats.tool_durations.values():
                 all_durations.extend(tool_stat.durations)
             if len(all_durations) >= self.history_threshold:
+                if debug:
+                    print(f"  -> program_all, {len(all_durations)} samples")
                 return all_durations, "program_all"
 
         # Try global tool-specific durations
         if tool_name and tool_name in self.global_tool_durations:
             durations = self.global_tool_durations[tool_name]
             if len(durations) >= self.history_threshold:
+                if debug:
+                    print(f"  -> global_tool:{tool_name}, {len(durations)} samples")
                 return durations, f"global_tool:{tool_name}"
 
         # Fallback: all global durations
@@ -658,9 +744,13 @@ class TTLManager:
         for durations in self.global_tool_durations.values():
             all_global.extend(durations)
         if len(all_global) >= self.history_threshold:
+            if debug:
+                print(f"  -> global_all, {len(all_global)} samples")
             return all_global, "global_all"
 
         # Not enough data
+        if debug:
+            print(f"  -> insufficient_data")
         return [], "insufficient_data"
 
     def _compute_cdf(self, durations: List[float], tau: float) -> float:
@@ -673,12 +763,38 @@ class TTLManager:
         count = sum(1 for d in durations if d <= tau)
         return count / len(durations)
 
-    def _generate_tau_grid(self) -> List[float]:
-        """Generate grid of τ values for grid search."""
-        if self.ttl_grid_points <= 1:
-            return [self.default_ttl]
-        step = (self.ttl_grid_max - self.ttl_grid_min) / (self.ttl_grid_points - 1)
-        return [self.ttl_grid_min + i * step for i in range(self.ttl_grid_points)]
+    def _generate_tau_grid(self, cdf_durations: List[float] = None) -> List[float]:
+        """Generate grid of τ values for grid search.
+
+        Per paper Section 4.1.4:
+        "枚举 S[f] 中所有唯一的工具调用时长作为候选（包括 τ=0），
+         选择期望奖励最高的。"
+
+        Uses unique historical duration values as candidates,
+        plus additional points for better coverage.
+
+        Args:
+            cdf_durations: Historical tool call durations to use as candidates
+        """
+        candidates = [0.0]  # τ=0 means no pinning (always included per paper)
+
+        # Paper: enumerate unique tool call durations from S[f] as candidates
+        if cdf_durations:
+            unique_durations = sorted(set(cdf_durations))
+            candidates.extend(unique_durations)
+
+        # If we don't have enough candidates, add linear grid points
+        if len(candidates) < 3:
+            if self.ttl_grid_points <= 1:
+                return [self.default_ttl]
+            step = (self.max_ttl - self.min_ttl) / max(self.ttl_grid_points - 1, 1)
+            for i in range(self.ttl_grid_points):
+                tau = self.min_ttl + i * step
+                if tau not in candidates:
+                    candidates.append(tau)
+
+        # Sort and deduplicate
+        return sorted(set(candidates))
 
 
 @dataclass

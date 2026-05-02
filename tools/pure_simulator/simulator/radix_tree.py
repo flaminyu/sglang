@@ -345,6 +345,10 @@ class RadixTree:
 
         This protects OTHER programs' pinned nodes while allowing the current program
         to reclaim its own pinned space if needed.
+        
+        Returns:
+            List of (node, was_forced_unpin) tuples. was_forced_unpin is True if the node
+            was pinned and had its pin removed to allow eviction.
         """
         if num_tokens <= 0:
             return []
@@ -390,16 +394,16 @@ class RadixTree:
             for creation_time, node in unpinned_nodes:
                 if freed_tokens >= num_tokens:
                     break
-                evicted.append(node)
+                evicted.append((node, False))  # Not forced unpin
                 freed_tokens += len(node.kv_indices)
                 self._evict_single_node(node, current_time)
                 evicted_this_round = True
 
-            # 2. Evict current program's pinned nodes
+            # 2. Evict current program's pinned nodes (forced unpin)
             for creation_time, node in current_pinned:
                 if freed_tokens >= num_tokens:
                     break
-                evicted.append(node)
+                evicted.append((node, True))  # Forced unpin
                 freed_tokens += len(node.kv_indices)
                 self._evict_single_node(node, current_time)
                 evicted_this_round = True
@@ -420,7 +424,7 @@ class RadixTree:
                 for creation_time, node in nodes_to_evict:
                     if freed_tokens >= num_tokens:
                         break
-                    evicted.append(node)
+                    evicted.append((node, True))  # Forced unpin
                     freed_tokens += len(node.kv_indices)
                     self._evict_single_node(node, current_time)
                     evicted_this_round = True
@@ -433,18 +437,17 @@ class RadixTree:
     
     def _evict_single_node(self, node: "TreeNode", current_time: float) -> None:
         """Helper to evict a single node."""
-        # If this node is pinned, unpin via TTLManager
+        # If this node is pinned, unpin via TTLManager first
+        # This will call dec_lock_ref which updates protected/evictable sizes
         if node.is_pinned and node.program_id and self.ttl_manager:
             # pinned_entries uses (program_id, node_id) tuple keys
             entry_key = (node.program_id, node.node_id)
             entry = self.ttl_manager.pinned_entries.get(entry_key)
             if entry:
                 self.ttl_manager.unpin_program(node.program_id, current_time, node.node_id)
-            else:
-                # Node was pinned but not in pinned_entries
-                node.unpin(current_time)
-                self.dec_lock_ref(node, current_time)
-
+        
+        # Now evictable_size should be correctly updated by dec_lock_ref
+        # Free the allocator space and remove from tree
         self.allocator.free(node.kv_indices)
         self._remove_node(node)
         self.token_count -= len(node.key)

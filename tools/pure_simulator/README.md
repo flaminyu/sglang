@@ -1,6 +1,6 @@
 # Pure Python KV Cache Simulator
 
-A standalone pure Python simulator that replicates SGLang's KV cache behavior for evaluating the Continuum TTL mechanism. Uses **RadixTree prefix matching** for accurate token sharing simulation.
+A standalone pure Python simulator that replicates SGLang's KV cache behavior for evaluating the Continuum TTL mechanism and L2 cache strategies. Uses **RadixTree prefix matching** for accurate token sharing simulation.
 
 ## Overview
 
@@ -9,54 +9,143 @@ This simulator provides a high-level simulation of KV cache operations without r
 - **Evaluate TTL pinning strategies** for multi-turn agent scenarios
 - **Benchmark cache hit rates** under various workloads
 - **Test eviction policies** (LRU, LFU, FIFO, Continuum)
-- **Analyze cache pressure scenarios** with synthetic request logs
+- **Analyze L2 cache strategies** (Baseline+L2 vs TTL+L2)
 - **Simulate tool exceptions** (timeouts, retries, errors) and their impact on TTL
 - **Event-driven simulation** with accurate queue delay modeling
 
-## Quick Start
+---
 
-### Basic Usage
+## 1. L2缓存实现详解
+
+### 1.1 架构
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         L2缓存架构                                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│   L1 (GPU HBM)              L2 (Host DRAM)                        │
+│   ┌─────────────────┐        ┌─────────────────┐                   │
+│   │                 │  D2H   │                 │                   │
+│   │  Eviction ──────┼──────►│  Backup        │                   │
+│   │                 │        │  (write_through)│                   │
+│   │                 │        │                 │                   │
+│   │                 │  H2D   │                 │                   │
+│   │  Load ◄────────┼───────┤  L2 Hit        │                   │
+│   │                 │        │                 │                   │
+│   └─────────────────┘        └─────────────────┘                   │
+│                                                                      │
+│   H2D带宽: 32 GB/s (PCIe 4.0 x16)                                 │
+│   D2H带宽: 64 GB/s (Host Memory Read)                              │
+│   固定开销: H2D=6.67μs, D2H=4.0μs                                 │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 带宽Amortization模型
+
+新的带宽模型考虑了固定开销：
+
+```python
+def calc_transfer_time(num_tokens, bytes_per_token, bandwidth_GBps, overhead_us, efficiency=0.85):
+    """
+    transfer_time = size × bw_eff / (overhead × bw_eff + size)
+
+    其中:
+    - size = tokens × bytes_per_token
+    - bw_eff = bandwidth × efficiency (0.85)
+    - overhead = H2D/D2H固定开销
+
+    效果:
+    - 小传输: 被固定开销主导
+    - 大传输: 接近原始带宽
+    """
+```
+
+### 1.3 L2缓存参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `h2d_bandwidth_GBps` | 32.0 | PCIe 4.0 x16带宽 |
+| `d2h_overhead_us` | 4.0 | D2H固定开销(微秒) |
+| `h2d_overhead_us` | 6.67 | H2D固定开销(微秒) |
+| `bandwidth_efficiency` | 0.85 | 有效带宽利用率 |
+| `memory_bandwidth_GBps` | 64.0 | Host内存读取带宽 |
+
+---
+
+## 2. 核心组件
+
+```
+simulator/
+├── timing.py              # 带宽模型 + amortization计算
+├── l2_cache.py          # L2缓存管理器（spill/load）
+├── state_manager.py      # StateManager for HiCache timing
+├── scheduler.py          # 请求调度器 + StateManager集成
+├── radix_tree.py        # RadixTree前缀匹配
+├── ttl_manager.py        # TTL pinning逻辑
+├── cache_allocator.py    # Token slot allocation/deallocation
+├── eviction.py          # Eviction policies
+├── request.py           # Request data structures
+└── stats.py            # Statistics collection
+```
+
+---
+
+## 3. 测试结果（2026-04-30）
+
+### 3.1 场景分析结果
+
+| 场景 | Baseline+L2 | TTL+L2 | 加速效果 |
+|------|-------------|--------|----------|
+| 小缓存(1k) | 1212.9s | 1212.9s | 相同 |
+| **中缓存(3k) x L2** | 958.2s | 678.1s | **1.41x** |
+| 大缓存(5k) x L2 | 1017.6s | 919.7s | 1.11x |
+| 高压(20程序) | 1151.8s | 1038.6s | 1.11x |
+| **长对话(50轮)** | 2277.8s | 1725.3s | **1.32x** |
+
+### 3.2 关键发现
+
+```
+TTL+L2 加速最明显的场景:
+1. 中大型L1 + 多轮对话 → L1能装下首轮，TTL保护后续轮次
+2. 长对话(50轮) → 1.32x加速，节省552s
+
+两者性能相同的场景:
+1. 小L1(1k) → 首轮就miss，TTL无数据可保护
+2. 超大prefill → 首轮 > L1+L2容量，全部重新计算
+```
+
+---
+
+## 4. 快速开始
+
+### 运行场景分析
 
 ```bash
 cd /home/comp/csgfyu/multi-agents/KVBlocking/sglang_continuum/tools/pure_simulator
 
-# Run comprehensive experiment with JCT analysis
-python experiments/run_comprehensive_experiment.py
+# 运行场景分析（Baseline+L2 vs TTL+L2）
+python scenario_analysis.py
 
-# Generate HTML report
-python experiments/generate_html_report.py
+# 运行TTL+L2对比测试
+python ttl_l2_comparison.py
 
-# Run three-variable experiment
-python experiments/run_three_var_experiment.py
-
-# Run exception scenario experiment
-python experiments/run_exception_experiment.py
-
-# Run single simulation
-python run_simulation.py requests.jsonl -c 100000 -t 5.0 -e lru -v
+# 运行单个模拟
+python run_simulation.py requests.jsonl -c 3000 --l2-capacity 10000 -v
 ```
 
-## Architecture
+### 测试脚本说明
 
-### Core Components
+| 脚本 | 用途 |
+|------|------|
+| `scenario_analysis.py` | **场景分析脚本** - Baseline+L2 vs TTL+L2对比 |
+| `ttl_l2_comparison.py` | TTL vs L2配置对比 |
+| `run_simulation.py` | 单个模拟运行器 |
 
-```
-simulator/
-├── main.py              # KVCacheSimulator orchestration (Event-driven + Batch modes)
-├── cache_allocator.py   # Token slot allocation/deallocation
-├── radix_tree.py       # Prefix-based KV cache storage with RadixTree
-├── radix_key.py        # Token sequence keys
-├── tree_node.py        # Radix tree nodes
-├── ttl_manager.py       # TTL pinning logic with forced unpin for deadlock prevention
-├── scheduler.py         # Request processing with priority scheduling
-├── eviction.py          # Eviction policies
-├── request.py          # Request data structures
-├── request_log.py      # Log file I/O
-├── stats.py            # Statistics collection
-└── timing.py          # Timing model (Prefill + Decode + TTFT)
-```
+---
 
-### Key Concepts
+## 5. 概念说明
 
 #### RadixTree Prefix Cache
 

@@ -79,9 +79,14 @@ class TreeNode:
     
     @property
     def is_valid(self) -> bool:
-        """A node is valid if it has KV cache and is not expired."""
+        """A node is valid if it has KV cache and is not expired.
+        
+        Note: This uses wall clock time. For simulation time, use check_expired(current_time).
+        """
         if not self.kv_indices:
             return False
+        # Use wall clock time for this property (for real-world use)
+        # Simulation code should use check_expired(current_time) instead
         return not self.is_expired
     
     def check_expired(self, current_time: float) -> bool:

@@ -3,7 +3,7 @@ RequestScheduler: Schedules and processes requests with the radix tree cache.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 from .radix_tree import RadixTree, MatchResult
 from .ttl_manager import TTLManager
@@ -11,10 +11,14 @@ from .tree_node import TreeNode
 from .request import Request, ProcessResult, BatchResult, RequestMetrics
 from .eviction import create_eviction_policy, EvictionPolicy
 from .timing import TimingCalculator, A100_80G, TimeBreakdown
+from .state_manager import StateManager
 
 
 class RequestScheduler:
     """Schedules and processes requests with cache operations."""
+
+    # Overlap scheduling: allow L2 load to overlap with previous inference
+    OVERLAP_SCHEDULE: bool = False
 
     def __init__(
         self,
@@ -139,7 +143,36 @@ class RequestScheduler:
             "num_evicted": len(process_result.evicted_nodes) if process_result.evicted_nodes else 0,
         }
         self.scheduling_log.append(log_entry)
-    
+
+    def _apply_overlap_scheduling(
+        self,
+        l2_load_dur: float,
+        inference_dur: float,
+        l2_backup_dur: float
+    ) -> float:
+        """
+        Apply overlap between L2 load and previous inference.
+
+        When OVERLAP_SCHEDULE is enabled, L2 load time can partially overlap
+        with the previous inference, reducing total latency.
+
+        Args:
+            l2_load_dur: L2 load duration in seconds
+            inference_dur: Current inference duration in seconds
+            l2_backup_dur: L2 backup duration in seconds
+
+        Returns:
+            Total effective duration considering overlap
+        """
+        if self.OVERLAP_SCHEDULE:
+            # L2 load can overlap with previous inference
+            last_inf = StateManager.get_last_inference_dur()
+            effective_load = max(l2_load_dur - last_inf, 0)
+            return effective_load + inference_dur + l2_backup_dur
+        else:
+            # No overlap: all operations are sequential
+            return l2_load_dur + inference_dur + l2_backup_dur
+
     def process_single(
         self, 
         req: Request, 
@@ -178,18 +211,24 @@ class RequestScheduler:
 
         hit_type = "L1+L2 Miss"
         l2_tokens = 0
+        l1_tokens = 0  # Will be set below
 
         if is_ttl_hit:
             hit_type = "TTL"
+            l1_tokens = process_result.matched_tokens  # All matched tokens are in L1 (pinned)
             self.radix_tree.stats.ttl_hits += 1
         elif process_result.l2_hit:
             hit_type = "L2"
             l2_tokens = process_result.l2_tokens
+            l1_tokens = 0  # Matched tokens are from L2, not L1
             self.radix_tree.stats.l2_hits += 1
         elif process_result.hit:
             hit_type = "L1"
+            l1_tokens = process_result.matched_tokens  # All matched tokens are in L1
             self.radix_tree.stats.l1_hits += 1
         else:
+            hit_type = "L1+L2 Miss"
+            l1_tokens = 0
             self.radix_tree.stats.cache_misses += 1
 
         # Get detailed time breakdown
@@ -205,7 +244,7 @@ class RequestScheduler:
             hit_type=hit_type,
             num_waiting=waiting_count,
             l2_tokens=l2_tokens,
-            l1_tokens=process_result.matched_tokens,  # Pass actual matched tokens
+            l1_tokens=l1_tokens,  # Now correctly set based on hit type
         )
         inf_time = time_breakdown.total_ms / 1000.0
 
@@ -215,6 +254,16 @@ class RequestScheduler:
         process_result.h2d_ms = time_breakdown.h2d_ms
         process_result.queue_delay_ms = time_breakdown.queue_delay_ms
         process_result.hit_type = hit_type
+
+        # StateManager integration for timing
+        # Advance clock for L2 load time (loaded before inference starts)
+        l2_load_time = StateManager.pop_hicache_l2_load_dur()
+        if l2_load_time > 0:
+            StateManager.step_global_clock(l2_load_time)
+
+        # Record inference duration for overlap calculations
+        StateManager.set_current_inference_dur(inf_time)
+        StateManager.step_global_clock(inf_time)
 
         # Log scheduling for debugging
         # start_time is current_time (when processing starts)
@@ -226,6 +275,11 @@ class RequestScheduler:
         )
 
         self._record_request_completion(req, process_result, current_time, hit_type, inf_time)
+
+        # Process L2 backup durations (accumulated during request processing)
+        l2_backup_time = StateManager.pop_hicache_l2_backup_dur()
+        if l2_backup_time > 0:
+            StateManager.step_global_clock(l2_backup_time)
 
         # TTL pinning handled by caller (main.py _on_request_complete)
 
@@ -252,18 +306,24 @@ class RequestScheduler:
             # Determine hit type and L2 load
             hit_type = "L1+L2 Miss"
             l2_tokens = 0
+            l1_tokens = 0
 
             if is_ttl_hit:
                 hit_type = "TTL"
+                l1_tokens = process_result.matched_tokens
                 self.radix_tree.stats.ttl_hits += 1
             elif process_result.l2_hit:
                 hit_type = "L2"
                 l2_tokens = process_result.l2_tokens
+                l1_tokens = 0
                 self.radix_tree.stats.l2_hits += 1
             elif process_result.hit:
                 hit_type = "L1"
+                l1_tokens = process_result.matched_tokens
                 self.radix_tree.stats.l1_hits += 1
             else:
+                hit_type = "L1+L2 Miss"
+                l1_tokens = 0
                 self.radix_tree.stats.cache_misses += 1
 
             # Get detailed time breakdown
@@ -276,6 +336,7 @@ class RequestScheduler:
                 hit_type=hit_type,
                 num_waiting=len(self.pending_queue),
                 l2_tokens=l2_tokens,
+                l1_tokens=l1_tokens,
             )
             inf_time = time_breakdown.total_ms / 1000.0
 
@@ -320,6 +381,11 @@ class RequestScheduler:
             else:
                 if process_result.last_node:
                     self.radix_tree.dec_lock_ref(process_result.last_node, current_time)
+
+        # Process L2 backup durations (accumulated during batch processing)
+        l2_backup_time = StateManager.pop_hicache_l2_backup_dur()
+        if l2_backup_time > 0:
+            StateManager.step_global_clock(l2_backup_time)
 
         return result
     
@@ -378,26 +444,33 @@ class RequestScheduler:
         else:
             # Full miss
             need_eviction = True
+            # Track L1 matched tokens BEFORE L2 lookup
+            l1_matched_before = matched_tokens
+            
             # Check L2 cache for matching tokens (load-back)
+            # L2 should only match tokens that L1 didn't match
             if self.l2_cache:
-                # Perform token-level prefix matching against L2
-                l2_match_len, l2_matches = self.l2_cache.match_l2(
-                    req.token_ids, req.extra_key
-                )
-                
-                if l2_match_len > 0:
-                    result.l2_hit = True
-                    result.l2_tokens = l2_match_len
-                    result.l2_matches = l2_matches
+                # Query L2 with only the unmatched portion of tokens
+                if l1_matched_before < len(req.token_ids):
+                    l2_query_tokens = req.token_ids[l1_matched_before:]
+                    l2_match_len, l2_matches = self.l2_cache.match_l2(
+                        l2_query_tokens, req.extra_key
+                    )
                     
-                    # Recalculate matched_tokens and new_tokens
-                    matched_tokens = matched_tokens + l2_match_len
-                    new_tokens = len(req.token_ids) - matched_tokens
-                    
-                    # Check if we still need eviction after L2 match
-                    if new_tokens <= self.radix_tree.allocator.available():
-                        need_eviction = False
-                    # If we need more space, eviction will handle it
+                    if l2_match_len > 0:
+                        result.l2_hit = True
+                        result.l2_tokens = l2_match_len
+                        result.l2_matches = l2_matches
+                        
+                        # Recalculate matched_tokens and new_tokens
+                        # L1 already matched l1_matched_before, L2 matched l2_match_len
+                        matched_tokens = l1_matched_before + l2_match_len
+                        new_tokens = len(req.token_ids) - matched_tokens
+                        
+                        # Check if we still need eviction after L2 match
+                        if new_tokens <= self.radix_tree.allocator.available():
+                            need_eviction = False
+                        # If we need more space, eviction will handle it
             
             self.radix_tree.stats.cache_misses += 1
         
@@ -441,21 +514,22 @@ class RequestScheduler:
                 
                 # Spill evicted nodes to L2 based on write_policy
                 if self.l2_cache:
-                    for node in evicted:
-                        # Check if node is currently TTL-protected
+                    for evicted_entry in evicted:
+                        # Handle new format: (node, was_forced_unpin)
+                        if isinstance(evicted_entry, tuple):
+                            node, was_forced_unpin = evicted_entry
+                        else:
+                            node = evicted_entry
+                            was_forced_unpin = False
+                        
+                        # Check if node is currently TTL-protected (active TTL)
+                        # Note: After _evict_single_node, node.is_pinned may be False
+                        # We need to check BEFORE unpinning
                         node_is_pinned = (
                             node.is_pinned and
                             node.program_id and
                             self.ttl_manager and
                             self.ttl_manager.is_pinned(node.program_id, current_time)
-                        )
-                        
-                        # Check if node was recently unpinned (forced unpin for eviction)
-                        # When a node is forced unpinned due to memory pressure,
-                        # it was previously protected by TTL but protection was removed
-                        was_recently_unpinned = (
-                            hasattr(node, '_force_unpinned_at') and
-                            current_time - node._force_unpinned_at < 0.1  # Within 100ms
                         )
                         
                         # Check if TTL has expired
@@ -466,13 +540,16 @@ class RequestScheduler:
                             current_time >= node.ttl_expiry_time
                         )
                         
-                        # Determine if we should spill based on write_policy
-                        # write_back: Don't spill if node is currently pinned OR was recently unpinned
-                        # (recently unpinned means it was protected by TTL, so don't waste L2 space)
-                        if self.l2_cache.write_policy == "write_back":
-                            should_spill = not (node_is_pinned or was_recently_unpinned)
-                        else:
-                            should_spill = True
+                        # Check if this node was forced to unpin (TTL-protected but evicted due to memory pressure)
+                        was_forced_unpinned = was_forced_unpin
+                        
+                        # Determine if we should spill using L2 cache's should_spill method
+                        # Key fix: When TTL expires, the data should still go to L2
+                        # to allow future recovery. Only active pinned nodes are protected.
+                        should_spill = self.l2_cache.should_spill(
+                            node_is_pinned=node_is_pinned,
+                            ttl_expired=ttl_expired
+                        )
                         
                         if should_spill:
                             self.l2_cache.spill_to_l2(
@@ -493,17 +570,6 @@ class RequestScheduler:
                 extra_key=req.extra_key
             )
             new_match = self.radix_tree.match_prefix(full_key)
-            print(f"  [DEBUG] {req.rid}: after eviction re-match: matched_tokens={new_match.matched_tokens}, hit={new_match.hit}")
-            if new_match.last_node:
-                print(f"  [DEBUG] last_node: id={new_match.last_node.node_id}, tokens={len(new_match.last_node.key)}, pinned={new_match.last_node.is_pinned}")
-            else:
-                # Debug: check what nodes exist
-                print(f"  [DEBUG] last_node is None, checking radix tree...")
-                all_nodes = list(self.radix_tree.nodes.values())
-                print(f"  [DEBUG] Total nodes: {len(all_nodes)}")
-                for n in all_nodes:
-                    if n != self.radix_tree.root:
-                        print(f"  [DEBUG] Node {n.node_id}: extra_key={n.key.extra_key}, tokens={n.key.token_ids[:5]}...")
             matched_tokens = new_match.matched_tokens
             new_tokens = len(req.token_ids) - matched_tokens
             cached_indices = new_match.cached_indices
@@ -722,6 +788,216 @@ class RequestScheduler:
             "ttl_pins": self.stats.ttl_pins,
             "forced_unpins": self.stats.forced_unpins,
         }
+
+    # ============= Batch Processing Methods =============
+
+    def batch_match_cache(self, batch: List[Request], current_time: float) -> Dict[str, Any]:
+        """
+        Batch cache matching - process multiple requests together.
+
+        Optimization (inspired by sglang-origin):
+        - Use existing match_prefix for each request
+        - Aggregate statistics for batch timing
+
+        Args:
+            batch: List of requests to match
+            current_time: Current simulation time
+
+        Returns:
+            Dictionary with batch matching results
+        """
+        if not batch:
+            return {'results': [], 'total_l1_tokens': 0, 'total_l2_tokens': 0}
+
+        results = []
+        total_l1 = 0
+        total_l2 = 0
+
+        for req in batch:
+            # Use existing match_prefix for each request
+            from .radix_key import RadixKey
+            full_key = RadixKey(token_ids=req.token_ids, extra_key=req.extra_key)
+            match_result = self.radix_tree.match_prefix(full_key)
+
+            l1_matched = match_result.matched_tokens
+
+            # Check L2 for unmatched tokens
+            l2_matched = 0
+            if self.l2_cache and l1_matched < len(req.token_ids):
+                l2_query = req.token_ids[l1_matched:]
+                l2_match_len, _ = self.l2_cache.match_l2(l2_query, req.extra_key)
+                l2_matched = l2_match_len
+
+            total_l1 += l1_matched
+            total_l2 += l2_matched
+
+            results.append({
+                'request': req,
+                'l1_matched': l1_matched,
+                'l2_matched': l2_matched,
+                'total_tokens': len(req.token_ids),
+                'new_tokens': len(req.token_ids) - l1_matched - l2_matched,
+            })
+
+        return {
+            'results': results,
+            'total_l1_tokens': total_l1,
+            'total_l2_tokens': total_l2,
+        }
+
+    def batch_evict_for_requests(
+        self,
+        batch: List[Request],
+        batch_results: List[Dict],
+        current_time: float,
+    ) -> List[Any]:
+        """
+        Batch eviction for multiple requests.
+
+        Optimization: Requests in the same batch that belong to the same program
+        should share cache space - don't evict each other's data.
+        """
+        from collections import defaultdict
+        program_requests = defaultdict(list)
+
+        for req_idx, req in enumerate(batch):
+            result = batch_results[req_idx]
+            program_requests[req.program_id].append((req_idx, req, result))
+
+        all_evicted = []
+
+        for prog_id, req_list in program_requests.items():
+            total_new_tokens = sum(r[2]['new_tokens'] for r in req_list)
+            total_l2_tokens = sum(r[2]['l2_matched'] for r in req_list)
+            needed = total_new_tokens + total_l2_tokens
+
+            if needed <= self.radix_tree.allocator.available():
+                continue
+
+            tokens_to_free = needed - self.radix_tree.allocator.available()
+
+            while tokens_to_free > 0:
+                ev = self.radix_tree.evict(tokens_to_free, current_time, prog_id)
+
+                if not ev:
+                    if self.ttl_manager:
+                        pinned = self.ttl_manager.get_pinned_programs_sorted(current_time)
+                        if pinned:
+                            avg_tokens = 50
+                            victims = max(1, (tokens_to_free + avg_tokens - 1) // avg_tokens)
+                            unpinned = self.ttl_manager.unpin_victims(
+                                self.radix_tree, current_time, max_victims=victims
+                            )
+                            if unpinned:
+                                continue
+                    break
+
+                all_evicted.extend(ev)
+                tokens_to_free -= sum(len(e.kv_indices) if hasattr(e, 'kv_indices') else 1 for e in ev)
+
+        # Handle L2 spill
+        if self.l2_cache:
+            for evicted_entry in all_evicted:
+                if isinstance(evicted_entry, tuple):
+                    node, was_forced = evicted_entry
+                else:
+                    node = evicted_entry
+                    was_forced = False
+
+                node_is_pinned = (
+                    node.is_pinned and node.program_id and
+                    self.ttl_manager and self.ttl_manager.is_pinned(node.program_id, current_time)
+                )
+                ttl_expired = (
+                    node.is_pinned and hasattr(node, 'ttl_expiry_time') and
+                    node.ttl_expiry_time is not None and current_time >= node.ttl_expiry_time
+                )
+                should_spill = self.l2_cache.should_spill(node_is_pinned=node_is_pinned, ttl_expired=ttl_expired)
+
+                if should_spill:
+                    self.l2_cache.spill_to_l2(
+                        node_id=node.node_id,
+                        token_count=len(node.kv_indices),
+                        token_ids=node.key.token_ids,
+                        extra_key=node.key.extra_key or "",
+                        current_time=current_time,
+                    )
+
+        # Load L2 data back to L1 for batch requests
+        # This is the critical fix: batch_match_cache only gives us counts,
+        # but we need to actually restore the L2 data to L1 for subsequent requests
+        from .radix_key import RadixKey
+        import os
+        DEBUG = os.environ.get('DEBUG_BATCH', '0') == '1'
+
+        for req_idx, result in enumerate(batch_results):
+            if result.get('l2_matched', 0) > 0:
+                req = batch[req_idx]
+
+                # Query L2 for full match data (batch_match_cache only gave us counts)
+                l2_query = req.token_ids[result['l1_matched']:]
+                l2_match_len, l2_matches = self.l2_cache.match_l2(l2_query, req.extra_key)
+
+                if DEBUG:
+                    print(f"  [DEBUG] batch_evict: req={req.rid} extra_key={req.extra_key} "
+                          f"l1={result['l1_matched']} l2_query={l2_query[:10] if l2_query else 'empty'}... "
+                          f"l2_entries={len(self.l2_cache.entries)} l2_match_len={l2_match_len} l2_matches={len(l2_matches)}")
+
+                if l2_match_len > 0:
+                    # Remove from L2
+                    for l2_node_id, l2_token_count, l2_token_ids in l2_matches:
+                        self.l2_cache.remove_entry(req.extra_key, l2_node_id)
+
+                        # Re-create node in L1 (radix tree)
+                        try:
+                            kv_indices = self.radix_tree.allocator.alloc(l2_token_count)
+                            l2_key = RadixKey(token_ids=l2_token_ids, extra_key=req.extra_key)
+                            self.radix_tree.insert_node(
+                                l2_key,
+                                kv_indices=kv_indices,
+                                node_id=l2_node_id,
+                                program_id=req.program_id,
+                            )
+                            # Update stats
+                            self.radix_tree.stats.l2_hits += 1
+                            if DEBUG:
+                                print(f"    [DEBUG] Restored L2->L1: node_id={l2_node_id} tokens={l2_token_count}")
+                        except RuntimeError as e:
+                            # Not enough space - shouldn't happen after eviction
+                            if DEBUG:
+                                print(f"    [DEBUG] Failed to restore L2->L1: {e}")
+                            pass
+
+                    # Update result with correct matched/new token counts
+                    result['l2_matched'] = l2_match_len
+                    result['new_tokens'] = result['total_tokens'] - result['l1_matched'] - l2_match_len
+
+        return all_evicted
+
+    def batch_load_l2_to_l1(
+        self,
+        batch: List[Request],
+        batch_results: List[Dict],
+    ) -> Tuple[float, List[Request]]:
+        """Batch L2 to L1 loading."""
+        l2_requests = []
+        total_tokens = 0
+
+        for req_idx, req in enumerate(batch):
+            result = batch_results[req_idx]
+            if result['l2_matched'] > 0:
+                l2_requests.append(req)
+                total_tokens += result['l2_matched']
+
+        if not l2_requests:
+            return 0.0, []
+
+        load_time_ms = self.timing.calculate_batch_l2_load(
+            total_tokens=total_tokens,
+            batch_size=len(l2_requests),
+        )
+
+        return load_time_ms, l2_requests
 
 
 @dataclass

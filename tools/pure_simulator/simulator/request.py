@@ -14,18 +14,18 @@ class Request:
     token_ids: List[int]
     input_len: int
     output_len: int
-    
+
     is_tool_call: bool = False
     tool_name: Optional[str] = None
     arrival_time: float = 0.0
-    
+
     prefix_match_len: int = 0
     cached_indices: List[int] = field(default_factory=list)
     kv_indices: List[int] = field(default_factory=list)
-    
+
     ttl_sec: Optional[float] = None
     is_pinned: bool = False
-    
+
     queue_start_time: Optional[float] = None
     queue_end_time: Optional[float] = None
     finish_time: Optional[float] = None
@@ -34,12 +34,15 @@ class Request:
     start_time: Optional[float] = None
 
     extra_key: Optional[str] = None
-    
+
     # Event-driven mode: original program arrival time (for FCFS ordering)
     program_arrival_time: float = 0.0
 
     # Real tool execution time (seconds) - used for TTL CDF calculation
     actual_tool_duration: Optional[float] = None
+
+    # Per Continuum paper Section 4.3: preempted requests get highest priority
+    is_preempted: bool = False
 
     def __post_init__(self):
         if self.input_len == 0:

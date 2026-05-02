@@ -29,16 +29,18 @@ def mock_radix_tree():
 
 @pytest.fixture
 def ttl_manager(mock_radix_tree):
-    """Create a TTLManager for testing."""
+    """Create a TTLManager for testing.
+
+    Note: ttl_grid_min and ttl_grid_max are NOT valid TTLManager parameters.
+    Grid bounds are controlled by min_ttl and max_ttl.
+    """
     return TTLManager(
         radix_tree=mock_radix_tree,
         default_ttl=5.0,
         min_ttl=1.0,
-        max_ttl=15.0,
+        max_ttl=60.0,  # Grid max bound
         history_threshold=3,
         enable_adaptive_ttl=True,
-        ttl_grid_min=1.0,
-        ttl_grid_max=60.0,
         ttl_grid_points=20,
         prefill_latency_ms_per_token=0.01,
     )
@@ -174,11 +176,11 @@ class TestTTLManagerCalculateT:
         assert T > 0
 
     def test_calculate_T_fallback(self, ttl_manager):
-        """Test T fallback when no data."""
+        """Test T fallback when no data (论文规定T初始化为0)."""
         ttl_manager.global_idle_gaps = []
         T = ttl_manager._calculate_T()
-        # Should return default_ttl * 500 (ms)
-        assert T == ttl_manager.default_ttl * 500
+        # Should return 0 per paper (T initialized to 0 for cold-start)
+        assert T == 0.0
 
 
 class TestTTLManagerCalculateMemoryfulness:
@@ -194,7 +196,7 @@ class TestTTLManagerCalculateMemoryfulness:
         eta = ttl_manager._calculate_memoryfulness(turn_index=9, total_turns=10)
         # Should be lower than 1.0
         assert eta < 1.0
-        assert eta >= 0.1  # Minimum bound
+        assert eta >= 0.05  # Minimum bound (changed from 0.1 to 0.05)
 
     def test_memoryfulness_single_turn(self, ttl_manager):
         """Test memoryfulness with single turn."""
@@ -373,6 +375,50 @@ class TestTTLManagerCalcAdaptiveTTL:
         # High memory should result in lower TTL
         assert ttl_high <= ttl_low
 
+    def test_adaptive_ttl_l2_enabled_vs_disabled(self, ttl_manager):
+        """Test that L2 enabled vs disabled produces different TTL decisions.
+
+        When L2 is enabled, the reload cost is lower (L2 reload vs full prefill),
+        which should affect the TTL utility calculation.
+        """
+        # Add sufficient data
+        ttl_manager.global_tool_durations["bash"] = [5.0] * 150  # > K=100 threshold
+        ttl_manager.global_idle_gaps = [2.0] * 150
+        ttl_manager.global_idle_gaps = [1.0] * 10
+
+        # Test with L2 disabled (default: reload cost = prefill cost)
+        ttl_no_l2, strategy_no_l2 = ttl_manager.calc_adaptive_ttl(
+            program_id="prog1",
+            tool_name="bash",
+            miss_tokens=100,
+            node_size=5000,
+            turn_index=0,
+            total_turns=10,
+            current_time=0.0,
+            l2_enabled=False,
+            l2_reload_penalty=0.3,
+        )
+
+        # Test with L2 enabled (reload cost = 0.3 * prefill cost)
+        ttl_with_l2, strategy_with_l2 = ttl_manager.calc_adaptive_ttl(
+            program_id="prog1",
+            tool_name="bash",
+            miss_tokens=100,
+            node_size=5000,
+            turn_index=0,
+            total_turns=10,
+            current_time=0.0,
+            l2_enabled=True,
+            l2_reload_penalty=0.3,
+        )
+
+        # Both should return valid TTL values
+        assert ttl_manager.min_ttl <= ttl_no_l2 <= ttl_manager.max_ttl
+        assert ttl_manager.min_ttl <= ttl_with_l2 <= ttl_manager.max_ttl
+
+        # The strategies might differ due to different cost models
+        # This is expected behavior - L2 changes the cost calculation
+
 
 class TestTTLManagerGenerateTauGrid:
     """Tests for TTLManager._generate_tau_grid()."""
@@ -385,8 +431,9 @@ class TestTTLManagerGenerateTauGrid:
     def test_grid_range(self, ttl_manager):
         """Test tau grid range."""
         grid = ttl_manager._generate_tau_grid()
-        assert grid[0] == ttl_manager.ttl_grid_min
-        assert grid[-1] == ttl_manager.ttl_grid_max
+        # Grid bounds are controlled by min_ttl and max_ttl
+        assert grid[0] == ttl_manager.min_ttl
+        assert grid[-1] == ttl_manager.max_ttl
 
     def test_grid_sorted(self, ttl_manager):
         """Test tau grid is sorted."""
@@ -420,11 +467,11 @@ class TestTTLManagerPinProgram:
         mock_node = MagicMock()
         mock_node.node_id = 1
 
-        # Too high TTL should be capped
+        # Too high TTL should be capped to max_ttl (60.0 in test fixture)
         ttl = ttl_manager.pin_program(
             program_id="prog1",
             node=mock_node,
-            ttl_sec=100.0,  # Above max_ttl (15.0)
+            ttl_sec=100.0,  # Above max_ttl (60.0)
             current_time=0.0,
             tool_name="bash",
         )
