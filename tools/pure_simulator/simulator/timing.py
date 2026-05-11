@@ -514,9 +514,11 @@ class TimingCalculator:
         - L2 hit: total - 0 = matched + l2 + new tokens → need prefill all!
         """
         h2d_ms = 0.0
-        
+
         if l2_tokens > 0:
-            # L2 hit: H2D transfer + prefill all tokens
+            # L2 hit: H2D transfer + prefill only NEW tokens
+            # L2 tokens are already computed KV cache, just need H2D transfer
+            # Only truly new tokens need prefill computation
             h2d_time = calc_transfer_time(
                 num_tokens=l2_tokens,
                 bytes_per_token=self.hw.bytes_per_token,
@@ -525,8 +527,9 @@ class TimingCalculator:
                 efficiency=self.hw.bandwidth_efficiency
             )
             h2d_ms = h2d_time * 1000  # Convert seconds to ms
-            # For L2 hit, l1_tokens=0, so prefill all tokens
-            prefill_ms = total_input_tokens * self.hw.prefill_latency_per_token_ms
+            # Calculate new tokens: total - L1 matched - L2 matched
+            new_tokens = total_input_tokens - l1_tokens - l2_tokens
+            prefill_ms = new_tokens * self.hw.prefill_latency_per_token_ms
         elif l1_tokens > 0:
             # L1 or TTL hit: prefill only the new tokens
             # TTL and L1 have the SAME prefill cost
@@ -647,6 +650,16 @@ class TimingCalculator:
             l1_tokens=cached_l1_tokens,
             l2_tokens=l2_tokens if hit_type == "L2" else 0,
         )
+
+        # TTL does NOT provide compute speedup - TTL and L1 have the SAME prefill cost.
+        # TTL benefits are:
+        # 1. Eviction protection - pinned programs' KV won't be evicted
+        # 2. Priority scheduling - pinned programs get scheduled first
+        # The actual time savings come from cache hits (prefill savings), not from TTL itself.
+        #
+        # Previous incorrect implementation applied a 0.5x speedup to TTL hits,
+        # which overestimated the benefit. TTL just protects data, it doesn't
+        # make the GPU compute faster.
 
         # Queueing delay: calculate from actual start time minus arrival time
         # This is the REAL queue wait time, not an estimate

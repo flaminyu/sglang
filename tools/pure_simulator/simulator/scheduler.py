@@ -407,6 +407,8 @@ class RequestScheduler:
         current_time: float,
         ttl_sec: float = None,
         tool_name: str = None,
+        skip_eviction: bool = False,
+        l2_matched_override: int = None,
     ) -> ProcessResult:
         from .radix_key import RadixKey
         
@@ -429,6 +431,7 @@ class RequestScheduler:
         
         # Check if we need eviction: either full miss OR partial hit with insufficient space
         need_eviction = False
+        _debug_l1_hit = False  # Track L1 hits for debugging
         
         if match_result.hit:
             # Partial or full hit - check if we need more space
@@ -439,8 +442,16 @@ class RequestScheduler:
                     need_eviction = True
                     self.radix_tree.stats.cache_hits += 1
                     self.radix_tree.stats.l1_hits += 1
+                    _debug_l1_hit = True
                     if match_result.last_node:
                         match_result.last_node.access(current_time)
+            else:
+                # Full hit - no eviction needed
+                self.radix_tree.stats.cache_hits += 1
+                self.radix_tree.stats.l1_hits += 1
+                _debug_l1_hit = True
+                if match_result.last_node:
+                    match_result.last_node.access(current_time)
         else:
             # Full miss
             need_eviction = True
@@ -474,8 +485,9 @@ class RequestScheduler:
             
             self.radix_tree.stats.cache_misses += 1
         
-        # Eviction logic
-        if need_eviction:
+        # Eviction logic - skip if skip_eviction=True (batch mode)
+        # In batch mode, eviction is done beforehand by batch_evict_for_requests
+        if need_eviction and not skip_eviction:
             needed_tokens = new_tokens
             unpin_attempted = False
             
@@ -661,9 +673,101 @@ class RequestScheduler:
                 )
                 self.stats.ttl_pins += 1
 
-        # Handle L2 load-back when L1 misses but L2 hits, and NO eviction is needed
-        # This can happen when the new tokens fit in available space
-        if result.l2_hit and result.l2_matches and not need_eviction:
+        elif skip_eviction:
+            # Batch mode: eviction was already done by batch_evict_for_requests
+            # Still need to allocate and insert tokens into the cache
+            
+            # In batch mode, L2 match was already done and data was restored to L1
+            # Use l2_matched_override if provided (from batch_evict_for_requests)
+            l2_restored_tokens = l2_matched_override if l2_matched_override is not None else 0
+            
+            # Total matched = L1 matched + L2 restored
+            # matched_tokens is from the initial match_result, which matches against the full token sequence
+            total_matched = matched_tokens + l2_restored_tokens
+            new_tokens_count = len(req.token_ids) - total_matched
+            
+            # CRITICAL FIX: Collect ALL cached indices from ALL matched nodes in the prefix path
+            # match_result.cached_indices only contains indices from the LAST matched node,
+            # but we need ALL indices from all matched nodes in the prefix path
+            all_cached_indices = []
+            for node in match_result.matched_nodes:
+                all_cached_indices.extend(node.kv_indices)
+            
+            # Debug: print state before insert
+            import os
+            DEBUG_SKIP = os.environ.get('DEBUG_BATCH', '0') == '1'
+            if DEBUG_SKIP:
+                print(f"    [DEBUG skip_eviction] {req.rid}: matched={matched_tokens}, total_matched={total_matched}, new={new_tokens_count}, cached_indices={len(all_cached_indices)}")
+                print(f"      allocator before: used={self.radix_tree.allocator.used()}, available={self.radix_tree.allocator.available()}")
+            
+            # Only allocate and insert if there are new tokens
+            if new_tokens_count > 0:
+                # Try to allocate space for new tokens
+                try:
+                    new_indices = self.radix_tree.allocator.alloc(new_tokens_count)
+                except RuntimeError:
+                    # Not enough space - this shouldn't happen in batch mode
+                    available = self.radix_tree.allocator.available()
+                    if available > 0:
+                        new_indices = self.radix_tree.allocator.alloc(available)
+                        new_tokens_count = available
+                    else:
+                        new_indices = []
+                
+                if DEBUG_SKIP:
+                    print(f"      allocated {len(new_indices)} indices: {new_indices[:5] if new_indices else 'empty'}...")
+                    print(f"      allocator after alloc: used={self.radix_tree.allocator.used()}, available={self.radix_tree.allocator.available()}")
+                
+                # Insert remaining tokens into the radix tree
+                # Use the unmatched portion of tokens (from original match)
+                remaining_tokens = len(req.token_ids) - matched_tokens
+                remaining_key = RadixKey(
+                    token_ids=req.token_ids[matched_tokens:],
+                    extra_key=req.extra_key
+                )
+                
+                if DEBUG_SKIP:
+                    print(f"      inserting key with {len(remaining_key.token_ids)} tokens")
+                
+                insert_result = self.radix_tree.insert(
+                    remaining_key,
+                    kv_indices=new_indices,
+                    create_new_indices=False
+                )
+                
+                if DEBUG_SKIP:
+                    print(f"      insert result: node_id={insert_result.node.node_id if insert_result.node else 'None'}")
+                    print(f"      allocator after insert: used={self.radix_tree.allocator.used()}, available={self.radix_tree.allocator.available()}")
+                    print(f"      radix nodes: {len(self.radix_tree.nodes)}")
+                
+                result.kv_indices = all_cached_indices + new_indices
+                result.node_for_pin = insert_result.node
+                result.last_node = insert_result.node  # Update last_node for TTL pinning logic
+            else:
+                # No new tokens, just use cached indices
+                result.kv_indices = all_cached_indices
+                result.node_for_pin = match_result.last_node
+                result.last_node = match_result.last_node
+            
+            # Update result
+            result.matched_tokens = total_matched
+            result.new_tokens = new_tokens_count
+            
+            # Handle TTL pinning for batch mode
+            if self.ttl_manager and ttl_sec and ttl_sec > 0 and result.node_for_pin:
+                self.ttl_manager.pin_program(
+                    req.program_id,
+                    result.node_for_pin,
+                    ttl_sec,
+                    current_time,
+                    tool_name
+                )
+                self.stats.ttl_pins += 1
+
+        # Handle L2 load-back when L1 misses but L2 hits
+        # This runs for both normal mode (need_eviction=False) and batch mode (skip_eviction=True)
+        # In batch mode, L2 loading should happen even if need_eviction=True (but space was freed by batch eviction)
+        if result.l2_hit and result.l2_matches and (not need_eviction or skip_eviction):
             l2_load_tokens = 0
             l2_kv_indices = []
             
@@ -854,48 +958,68 @@ class RequestScheduler:
         """
         Batch eviction for multiple requests.
 
-        Optimization: Requests in the same batch that belong to the same program
-        should share cache space - don't evict each other's data.
+        Key strategy: Only evict nodes that are NOT in the current batch.
+        This protects all cache hits within the batch, even for other programs.
         """
-        from collections import defaultdict
-        program_requests = defaultdict(list)
-
-        for req_idx, req in enumerate(batch):
-            result = batch_results[req_idx]
-            program_requests[req.program_id].append((req_idx, req, result))
-
-        all_evicted = []
-
-        for prog_id, req_list in program_requests.items():
-            total_new_tokens = sum(r[2]['new_tokens'] for r in req_list)
-            total_l2_tokens = sum(r[2]['l2_matched'] for r in req_list)
-            needed = total_new_tokens + total_l2_tokens
-
-            if needed <= self.radix_tree.allocator.available():
+        import os
+        DEBUG = os.environ.get('DEBUG_BATCH', '0') == '1'
+        
+        # Collect all program_ids in the batch
+        batch_program_ids = set(req.program_id for req in batch)
+        
+        # Calculate total space needed for the entire batch
+        total_new_tokens = sum(r['new_tokens'] for r in batch_results)
+        total_l2_tokens = sum(r['l2_matched'] for r in batch_results)
+        total_needed = total_new_tokens + total_l2_tokens
+        
+        available = self.radix_tree.allocator.available()
+        
+        if DEBUG:
+            print(f"  [DEBUG batch_evict] total_needed={total_needed}, available={available}, "
+                  f"batch_programs={len(batch_program_ids)}")
+        
+        if total_needed <= available:
+            if DEBUG:
+                print(f"  [DEBUG batch_evict] No eviction needed")
+            self._batch_restore_l2_to_l1(batch, batch_results, current_time)
+            return []
+        
+        tokens_to_free = total_needed - available
+        
+        if DEBUG:
+            print(f"  [DEBUG batch_evict] Need to free {tokens_to_free} tokens")
+        
+        # Batch mode: ONLY evict nodes from programs NOT in the batch
+        all_leaves = self.radix_tree._get_all_leaf_nodes()
+        evictable_nodes = []
+        
+        for node in all_leaves:
+            if not node.kv_indices:
                 continue
-
-            tokens_to_free = needed - self.radix_tree.allocator.available()
-
-            while tokens_to_free > 0:
-                ev = self.radix_tree.evict(tokens_to_free, current_time, prog_id)
-
-                if not ev:
-                    if self.ttl_manager:
-                        pinned = self.ttl_manager.get_pinned_programs_sorted(current_time)
-                        if pinned:
-                            avg_tokens = 50
-                            victims = max(1, (tokens_to_free + avg_tokens - 1) // avg_tokens)
-                            unpinned = self.ttl_manager.unpin_victims(
-                                self.radix_tree, current_time, max_victims=victims
-                            )
-                            if unpinned:
-                                continue
-                    break
-
-                all_evicted.extend(ev)
-                tokens_to_free -= sum(len(e.kv_indices) if hasattr(e, 'kv_indices') else 1 for e in ev)
-
-        # Handle L2 spill
+            # ONLY evict nodes from programs NOT in the batch
+            if node.program_id not in batch_program_ids:
+                evictable_nodes.append((node.creation_time, node))
+        
+        # Sort by creation time (oldest first - LRU)
+        evictable_nodes.sort(key=lambda x: x[0])
+        
+        all_evicted = []
+        
+        # Evict until we have enough space
+        idx = 0
+        while tokens_to_free > 0 and idx < len(evictable_nodes):
+            _, node = evictable_nodes[idx]
+            idx += 1
+            
+            if DEBUG:
+                print(f"  [DEBUG batch_evict] Evicting node program_id={node.program_id} "
+                      f"tokens={len(node.kv_indices)}")
+            
+            self.radix_tree._evict_single_node(node, current_time)
+            all_evicted.append((node, False))
+            tokens_to_free -= len(node.kv_indices)
+        
+        # Handle L2 spill for evicted nodes
         if self.l2_cache:
             for evicted_entry in all_evicted:
                 if isinstance(evicted_entry, tuple):
@@ -912,7 +1036,10 @@ class RequestScheduler:
                     node.is_pinned and hasattr(node, 'ttl_expiry_time') and
                     node.ttl_expiry_time is not None and current_time >= node.ttl_expiry_time
                 )
-                should_spill = self.l2_cache.should_spill(node_is_pinned=node_is_pinned, ttl_expired=ttl_expired)
+                should_spill = self.l2_cache.should_spill(
+                    node_is_pinned=node_is_pinned,
+                    ttl_expired=ttl_expired
+                )
 
                 if should_spill:
                     self.l2_cache.spill_to_l2(
@@ -922,29 +1049,41 @@ class RequestScheduler:
                         extra_key=node.key.extra_key or "",
                         current_time=current_time,
                     )
-
-        # Load L2 data back to L1 for batch requests
-        # This is the critical fix: batch_match_cache only gives us counts,
-        # but we need to actually restore the L2 data to L1 for subsequent requests
-        from .radix_key import RadixKey
+        
+        # Handle L2->L1 restoration
+        self._batch_restore_l2_to_l1(batch, batch_results, current_time)
+        
+        return all_evicted
+    
+    def _batch_restore_l2_to_l1(
+        self,
+        batch: List[Request],
+        batch_results: List[Dict],
+        current_time: float,
+    ) -> None:
+        """Restore L2 data to L1 for batch requests."""
         import os
         DEBUG = os.environ.get('DEBUG_BATCH', '0') == '1'
-
+        
+        from .radix_key import RadixKey
+        
+        if DEBUG:
+            print(f"  [DEBUG _batch_restore_l2_to_l1] Starting...")
+        
         for req_idx, result in enumerate(batch_results):
             if result.get('l2_matched', 0) > 0:
                 req = batch[req_idx]
 
-                # Query L2 for full match data (batch_match_cache only gave us counts)
+                # Query L2 for full match data
                 l2_query = req.token_ids[result['l1_matched']:]
                 l2_match_len, l2_matches = self.l2_cache.match_l2(l2_query, req.extra_key)
 
                 if DEBUG:
-                    print(f"  [DEBUG] batch_evict: req={req.rid} extra_key={req.extra_key} "
-                          f"l1={result['l1_matched']} l2_query={l2_query[:10] if l2_query else 'empty'}... "
-                          f"l2_entries={len(self.l2_cache.entries)} l2_match_len={l2_match_len} l2_matches={len(l2_matches)}")
+                    print(f"    [DEBUG] req={req.rid} extra_key={req.extra_key} "
+                          f"l1={result['l1_matched']} l2_match_len={l2_match_len}")
 
                 if l2_match_len > 0:
-                    # Remove from L2
+                    # Remove from L2 and restore to L1
                     for l2_node_id, l2_token_count, l2_token_ids in l2_matches:
                         self.l2_cache.remove_entry(req.extra_key, l2_node_id)
 
@@ -961,18 +1100,32 @@ class RequestScheduler:
                             # Update stats
                             self.radix_tree.stats.l2_hits += 1
                             if DEBUG:
-                                print(f"    [DEBUG] Restored L2->L1: node_id={l2_node_id} tokens={l2_token_count}")
+                                print(f"      [DEBUG] Restored L2->L1: node_id={l2_node_id} tokens={l2_token_count}")
                         except RuntimeError as e:
-                            # Not enough space - shouldn't happen after eviction
                             if DEBUG:
-                                print(f"    [DEBUG] Failed to restore L2->L1: {e}")
+                                print(f"      [DEBUG] Failed to restore L2->L1: {e}")
                             pass
 
-                    # Update result with correct matched/new token counts
-                    result['l2_matched'] = l2_match_len
-                    result['new_tokens'] = result['total_tokens'] - result['l1_matched'] - l2_match_len
+                    # CRITICAL FIX: After restoring L2->L1, update the batch result
+                    # But keep l2_matched for hit type determination
+                    result['l1_matched'] = result.get('l1_matched', 0) + l2_match_len
+                    # Note: Do NOT set result['l2_matched'] = 0
+                    # L2 matched count is preserved for proper hit type reporting
+                    result['new_tokens'] = result['total_tokens'] - result['l1_matched'] - result.get('l2_matched', 0)
 
-        return all_evicted
+    def _update_batch_hit_stats(self, batch_results: List[Dict]) -> None:
+        """Update cache hit statistics based on batch results."""
+        for result in batch_results:
+            l1_matched = result.get('l1_matched', 0)
+            l2_matched = result.get('l2_matched', 0)
+            total_tokens = result.get('total_tokens', 0)
+            
+            if l1_matched + l2_matched == 0:
+                self.radix_tree.stats.cache_misses += 1
+            elif l2_matched > 0:
+                self.radix_tree.stats.l2_hits += 1
+            else:
+                self.radix_tree.stats.l1_hits += 1
 
     def batch_load_l2_to_l1(
         self,

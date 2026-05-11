@@ -110,11 +110,15 @@ class TTLManager:
         self.pinned_entries: Dict[str, PinnedEntry] = {}
         self.history: List[ToolExecution] = []
         self.stats = TTLStats()
+        
+        # Timeline tracking for failure analysis
+        self.timeline_tracker = TTLTimelineTracker()
 
         # Adaptive TTL statistics tracking
         self.program_stats: Dict[str, ProgramStats] = {}
         self.global_tool_durations: Dict[str, List[float]] = {}
         self.global_idle_gaps: List[float] = []
+        self.global_queueing_delays: List[float] = []  # Track actual queueing delays for T calculation
         self.memoryfulness_factor: float = 1.0
 
         # Track TTL values used for adaptive TTL
@@ -170,6 +174,15 @@ class TTLManager:
                 self.history = self.history[-500:]
         
         self.stats.total_pins += 1
+        
+        # Record timeline event
+        self.timeline_tracker.record_pin(
+            program_id=program_id,
+            node_id=node.node_id,
+            ttl_sec=ttl_sec,
+            current_time=current_time,
+            reason=tool_name or "program pin"
+        )
         return ttl_sec
     
     def unpin_program(self, program_id: str, current_time: float = 0.0, node_id: int = None) -> bool:
@@ -222,6 +235,10 @@ class TTLManager:
         for prog_id in expired_programs:
             self.unpin_program(prog_id, current_time)
             self.stats.expired_pins += 1
+            # Record timeline event for expiration
+            for key, entry in list(self.pinned_entries.items()):
+                if isinstance(key, tuple) and key[0] == prog_id:
+                    self.timeline_tracker.record_expire(prog_id, entry.node_id, current_time)
         
         # Also clean up radix tree nodes with TTL expiry times
         self.radix_tree.cleanup_expired_ttls(current_time)
@@ -358,6 +375,7 @@ class TTLManager:
         tool_name: str,
         duration: float,
         idle_gap: float = 0.0,
+        queueing_delay: float = 0.0,
     ) -> None:
         """Record tool execution for CDF calculation.
 
@@ -366,6 +384,7 @@ class TTLManager:
             tool_name: The tool that was executed
             duration: How long the tool execution took
             idle_gap: Time gap between this turn and the next
+            queueing_delay: Actual queueing delay (waiting time) for this request
         """
         # Record global tool durations
         if tool_name not in self.global_tool_durations:
@@ -380,6 +399,12 @@ class TTLManager:
             if len(self.global_idle_gaps) > 1000:
                 self.global_idle_gaps = self.global_idle_gaps[-500:]
 
+        # Record queueing delay for T calculation
+        if queueing_delay > 0:
+            self.global_queueing_delays.append(queueing_delay)
+            if len(self.global_queueing_delays) > 1000:
+                self.global_queueing_delays = self.global_queueing_delays[-500:]
+
         # Record program-specific stats
         if program_id not in self.program_stats:
             self.program_stats[program_id] = ProgramStats(program_id=program_id)
@@ -387,6 +412,95 @@ class TTLManager:
         prog_stats = self.program_stats[program_id]
         prog_stats.get_tool_stats(tool_name).add_duration(duration)
         prog_stats.add_idle_gap(idle_gap)
+    
+    def record_ttl_failure(self, program_id: str, current_time: float, 
+                          reason: str = "TTL expired") -> None:
+        """Record a TTL failure event for timeline analysis."""
+        self.timeline_tracker.record_miss(program_id, current_time, reason)
+    
+    def get_timeline_data(self) -> List[Dict]:
+        """Get TTL timeline data for visualization."""
+        return self.timeline_tracker.get_timeline_data()
+    
+    def get_ttl_lifecycle_summary(self) -> Dict:
+        """Get TTL lifecycle summary statistics."""
+        return self.timeline_tracker.get_lifecycle_summary()
+    
+    def get_ttl_failure_analysis(self) -> Dict:
+        """Get TTL failure analysis."""
+        return self.timeline_tracker.get_failure_analysis()
+    
+    def record_prediction(
+        self,
+        program_id: str,
+        tool_name: str,
+        predicted_ttl: float,
+        actual_duration: float,
+        cdf_samples: int,
+        strategy: str,
+        cache_hit: bool,
+        current_time: float,
+        memory_pressure: float = 0.0
+    ) -> None:
+        """Record TTL prediction vs actual outcome for analysis."""
+        prediction = TTLPrediction(
+            timestamp=current_time,
+            program_id=program_id,
+            tool_name=tool_name,
+            predicted_ttl=predicted_ttl,
+            actual_duration=actual_duration,
+            cdf_samples=cdf_samples,
+            strategy=strategy,
+            cache_hit=cache_hit,
+            memory_pressure=memory_pressure
+        )
+        self.timeline_tracker.record_prediction(prediction)
+    
+    def get_prediction_data(self) -> List[Dict]:
+        """Get TTL prediction data for visualization."""
+        return [
+            {
+                'timestamp': p.timestamp,
+                'program': p.program_id,
+                'tool': p.tool_name,
+                'predicted_ttl': p.predicted_ttl,
+                'actual_duration': p.actual_duration,
+                'cdf_samples': p.cdf_samples,
+                'strategy': p.strategy,
+                'cache_hit': p.cache_hit,
+                'memory_pressure': p.memory_pressure,
+                'error': p.predicted_ttl - p.actual_duration if p.predicted_ttl > 0 else 0,
+                'error_pct': (p.predicted_ttl - p.actual_duration) / p.actual_duration * 100 if p.actual_duration > 0 else 0
+            }
+            for p in self.timeline_tracker.predictions
+        ]
+    
+    def get_prediction_stats(self) -> Dict:
+        """Get prediction statistics."""
+        predictions = self.timeline_tracker.predictions
+        if not predictions:
+            return {}
+        
+        errors = [p.predicted_ttl - p.actual_duration for p in predictions if p.predicted_ttl > 0]
+        error_pcts = [(p.predicted_ttl - p.actual_duration) / p.actual_duration * 100 
+                     for p in predictions if p.actual_duration > 0 and p.predicted_ttl > 0]
+        
+        ttl_underestimates = sum(1 for p in predictions if p.predicted_ttl > 0 and p.predicted_ttl < p.actual_duration)
+        ttl_overestimates = sum(1 for p in predictions if p.predicted_ttl > 0 and p.predicted_ttl > p.actual_duration)
+        
+        cache_hits = sum(1 for p in predictions if p.cache_hit)
+        
+        return {
+            'total_predictions': len(predictions),
+            'avg_predicted_ttl': sum(p.predicted_ttl for p in predictions if p.predicted_ttl > 0) / max(len([p for p in predictions if p.predicted_ttl > 0]), 1),
+            'avg_actual_duration': sum(p.actual_duration for p in predictions) / len(predictions),
+            'avg_error': sum(errors) / len(errors) if errors else 0,
+            'avg_error_pct': sum(error_pcts) / len(error_pcts) if error_pcts else 0,
+            'ttl_underestimates': ttl_underestimates,
+            'ttl_overestimates': ttl_overestimates,
+            'ttl_underestimate_rate': ttl_underestimates / max(len([p for p in predictions if p.predicted_ttl > 0]), 1),
+            'cache_hit_rate': cache_hits / len(predictions),
+        }
 
     def calc_adaptive_ttl(
         self,
@@ -399,7 +513,7 @@ class TTLManager:
         current_time: float,
         l2_enabled: bool = False,
         l2_reload_penalty: float = None,
-    ) -> Tuple[float, str]:
+    ) -> Tuple[float, str, int]:
         """Calculate optimal TTL using paper's utility model with L1 penalty.
 
         τ* = argmax_τ  P(τ, f) × (T·η + Prefill-Reload(r)) - (MemUsage(r)/M) × τ
@@ -426,7 +540,7 @@ class TTLManager:
                               If None, uses self.l1_reload_penalty.
 
         Returns:
-            (ttl_seconds, strategy_name)
+            (ttl_seconds, strategy_name, cdf_samples)
         """
         if not self.enable_adaptive_ttl:
             return self.default_ttl, "disabled"
@@ -475,20 +589,30 @@ class TTLManager:
             # Track adaptive TTL history
             self.adaptive_ttl_history.append((program_id, best_ttl, best_strategy))
 
-            return best_ttl, best_strategy
+            return best_ttl, best_strategy, len(cdf_durations)
 
         # Track default TTL usage
         self.adaptive_ttl_history.append((program_id, self.default_ttl, "default"))
-        return self.default_ttl, "default"
+        return self.default_ttl, "default", 0
 
     def _calculate_T(self) -> float:
         """T: Unit memory average queueing delay (ms per token).
 
-        Based on idle gaps between requests.
-        Returns queueing delay per unit of memory usage.
+        Per Continuum paper: T represents the average queueing delay per unit memory.
+        Formula: T = avg_queueing_delay / avg_memory_per_active_request
 
-        Per Continuum paper: T initialized to 0 for cold-start.
+        We track actual queueing delays (waiting time when requests are blocked)
+        and normalize by average memory usage per active request.
         """
+        if self.global_queueing_delays:
+            try:
+                avg_queueing = statistics.mean(self.global_queueing_delays) * 1000  # Convert to ms
+                avg_memory_per_request = self._get_avg_memory_per_request()
+                if avg_memory_per_request > 0:
+                    return avg_queueing / avg_memory_per_request
+            except statistics.StatisticsError:
+                pass
+        # Fallback to idle gaps if no queueing data (for cold-start)
         if self.global_idle_gaps:
             try:
                 avg_gap = statistics.mean(self.global_idle_gaps)
@@ -501,6 +625,12 @@ class TTLManager:
                 pass
         # Fallback: return 0 per paper (论文规定T初始化为0)
         return 0.0
+
+    def _get_avg_memory_per_request(self) -> float:
+        """Calculate average memory per active request for T calculation."""
+        active = self.radix_tree.allocator.used()
+        num_programs = max(len(self.get_pinned_programs()), 1)
+        return active / num_programs
 
     def _calculate_memoryfulness(self, turn_index: int, total_turns: int) -> float:
         """η: Memoryfulness factor = -Corr(k, N-k).
@@ -613,12 +743,11 @@ class TTLManager:
         else:
             prefill_reload = prefill_cost_ms
 
-        # Calculate memory holding cost per second (in ms)
-        # Per paper: Cost = (MemUsage(r)/M) × τ
-        # Here we express it as: cost_per_sec_ms × τ
-        # where cost_per_sec_ms represents the opportunity cost per second
-        mem_usage = node_size / max(capacity, 1)
-        cost_per_sec_ms = mem_usage * 10  # ms per second per unit memory usage
+        # Calculate memory holding cost per τ seconds
+        # Per paper: Cost(τ, r) = (MemUsage(r)/M) × τ
+        # where MemUsage(r)/M = node_size/capacity (relative size of pinned request)
+        # This represents the "number of average requests blocked" by pinning this request
+        mem_usage_ratio = node_size / max(capacity, 1)
 
         # No-TTL strategy: always miss, pay reload/prefill cost
         # But we don't add this to optimization - TTL is only better if positive
@@ -654,8 +783,8 @@ class TTLManager:
             benefit = benefit_queue + benefit_prefill_reload
 
             # Cost = memory holding cost × τ
-            # Per paper: Cost = (MemUsage(r)/M) × τ
-            cost = cost_per_sec_ms * tau
+            # Per paper: Cost = (MemUsage(r)/M) × τ (unitless coefficient)
+            cost = mem_usage_ratio * tau
 
             # TTL + write_back utility
             utility_ttl_wb = benefit - cost
@@ -805,3 +934,193 @@ class TTLStats:
     ttl_extensions: int = 0
     cache_hits_while_pinned: int = 0
     forced_unpins: int = 0
+
+
+@dataclass
+class TTLEvent:
+    """Record of a TTL lifecycle event for timeline tracking."""
+    timestamp: float
+    event_type: str  # 'pin', 'unpin', 'expire', 'hit', 'miss', 'extend'
+    program_id: str
+    node_id: int
+    ttl_sec: float
+    remaining_ttl: float = 0.0
+    reason: str = ""
+    cache_hit: bool = False
+
+
+@dataclass
+class TTLPrediction:
+    """Record of TTL prediction vs actual tool execution."""
+    timestamp: float
+    program_id: str
+    tool_name: str
+    predicted_ttl: float
+    actual_duration: float
+    cdf_samples: int
+    strategy: str
+    cache_hit: bool = False
+    memory_pressure: float = 0.0
+
+
+class TTLTimelineTracker:
+    """Tracks TTL lifecycle events for timeline visualization and failure analysis."""
+    
+    def __init__(self):
+        self.events: List[TTLEvent] = []
+        self.pinned_lifecycles: Dict[str, Dict] = {}  # program_id -> lifecycle info
+        # Track predictions vs actuals
+        self.predictions: List[TTLPrediction] = []
+        
+    def record_prediction(self, prediction: TTLPrediction) -> None:
+        """Record a TTL prediction with actual outcome."""
+        self.predictions.append(prediction)
+        if len(self.predictions) > 10000:  # Keep last 10000 predictions
+            self.predictions = self.predictions[-5000:]
+    
+    def record_pin(self, program_id: str, node_id: int, ttl_sec: float, 
+                   current_time: float, reason: str = "") -> None:
+        """Record a TTL pin event."""
+        self.events.append(TTLEvent(
+            timestamp=current_time,
+            event_type='pin',
+            program_id=program_id,
+            node_id=node_id,
+            ttl_sec=ttl_sec,
+            remaining_ttl=ttl_sec,
+            reason=reason
+        ))
+        # Track lifecycle
+        if program_id not in self.pinned_lifecycles:
+            self.pinned_lifecycles[program_id] = {
+                'pin_time': current_time,
+                'ttl_sec': ttl_sec,
+                'expire_time': current_time + ttl_sec,
+                'hit_count': 0,
+                'miss_count': 0,
+                'unpin_time': None,
+                'unpin_reason': None
+            }
+        else:
+            # Update TTL (may have been extended)
+            self.pinned_lifecycles[program_id]['ttl_sec'] = ttl_sec
+            self.pinned_lifecycles[program_id]['expire_time'] = current_time + ttl_sec
+    
+    def record_hit(self, program_id: str, current_time: float) -> None:
+        """Record a cache hit while TTL is active."""
+        self.events.append(TTLEvent(
+            timestamp=current_time,
+            event_type='hit',
+            program_id=program_id,
+            node_id=-1,
+            ttl_sec=0.0,
+            remaining_ttl=0.0,
+            cache_hit=True
+        ))
+        if program_id in self.pinned_lifecycles:
+            self.pinned_lifecycles[program_id]['hit_count'] += 1
+    
+    def record_miss(self, program_id: str, current_time: float, 
+                    reason: str = "TTL expired") -> None:
+        """Record a cache miss due to TTL failure."""
+        self.events.append(TTLEvent(
+            timestamp=current_time,
+            event_type='miss',
+            program_id=program_id,
+            node_id=-1,
+            ttl_sec=0.0,
+            remaining_ttl=0.0,
+            reason=reason,
+            cache_hit=False
+        ))
+        if program_id in self.pinned_lifecycles:
+            self.pinned_lifecycles[program_id]['miss_count'] += 1
+    
+    def record_expire(self, program_id: str, node_id: int, current_time: float) -> None:
+        """Record TTL expiration event."""
+        self.events.append(TTLEvent(
+            timestamp=current_time,
+            event_type='expire',
+            program_id=program_id,
+            node_id=node_id,
+            ttl_sec=0.0,
+            remaining_ttl=0.0,
+            reason="TTL timer expired"
+        ))
+        if program_id in self.pinned_lifecycles:
+            self.pinned_lifecycles[program_id]['unpin_time'] = current_time
+            self.pinned_lifecycles[program_id]['unpin_reason'] = "expired"
+    
+    def record_unpin(self, program_id: str, node_id: int, current_time: float,
+                     reason: str = "") -> None:
+        """Record explicit unpin event."""
+        self.events.append(TTLEvent(
+            timestamp=current_time,
+            event_type='unpin',
+            program_id=program_id,
+            node_id=node_id,
+            ttl_sec=0.0,
+            remaining_ttl=0.0,
+            reason=reason
+        ))
+        if program_id in self.pinned_lifecycles:
+            self.pinned_lifecycles[program_id]['unpin_time'] = current_time
+            self.pinned_lifecycles[program_id]['unpin_reason'] = reason
+    
+    def get_timeline_data(self) -> List[Dict]:
+        """Get timeline data for visualization."""
+        return [
+            {
+                'timestamp': e.timestamp,
+                'event': e.event_type,
+                'program': e.program_id,
+                'node': e.node_id,
+                'ttl': e.ttl_sec,
+                'remaining': e.remaining_ttl,
+                'reason': e.reason
+            }
+            for e in self.events
+        ]
+    
+    def get_lifecycle_summary(self) -> Dict:
+        """Get summary statistics for TTL lifecycles."""
+        if not self.pinned_lifecycles:
+            return {}
+        
+        lifecycles = list(self.pinned_lifecycles.values())
+        durations = []
+        hit_rates = []
+        
+        for lc in lifecycles:
+            if lc['unpin_time']:
+                duration = lc['unpin_time'] - lc['pin_time']
+                durations.append(duration)
+            total = lc['hit_count'] + lc['miss_count']
+            if total > 0:
+                hit_rates.append(lc['hit_count'] / total)
+        
+        return {
+            'total_pins': len(lifecycles),
+            'avg_duration': sum(durations) / len(durations) if durations else 0,
+            'max_duration': max(durations) if durations else 0,
+            'min_duration': min(durations) if durations else 0,
+            'avg_hit_rate': sum(hit_rates) / len(hit_rates) if hit_rates else 0,
+            'lifecycles': self.pinned_lifecycles
+        }
+    
+    def get_failure_analysis(self) -> Dict:
+        """Analyze TTL failure patterns."""
+        miss_events = [e for e in self.events if e.event_type == 'miss']
+        expire_events = [e for e in self.events if e.event_type == 'expire']
+        
+        failure_reasons = {}
+        for e in miss_events:
+            reason = e.reason or "unknown"
+            failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+        
+        return {
+            'total_misses': len(miss_events),
+            'total_expires': len(expire_events),
+            'failure_reasons': failure_reasons,
+            'failure_rate': len(miss_events) / max(len(self.events), 1)
+        }

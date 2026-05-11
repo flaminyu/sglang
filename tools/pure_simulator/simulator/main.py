@@ -423,29 +423,35 @@ class KVCacheSimulator:
                 self.ttl_manager.cleanup_expired(self.current_time)
 
             if enable_batch:
-                # Batch mode: collect waiting requests regardless of their exact arrival time
-                # Sort by arrival time and process in batches
-                sorted_queue = sorted(self.waiting_queue, key=lambda r: r.arrival_time)
+                # Batch mode: process ready requests in batches
+                # Step 1: Filter ready requests (arrival_time <= current_time)
+                ready_requests = [req for req in self.waiting_queue if req.arrival_time <= self.current_time]
                 
-                if not sorted_queue:
-                    break
+                if not ready_requests:
+                    # No ready requests, advance time to next arrival (same as single mode)
+                    if self.waiting_queue:
+                        next_arrival = min(req.arrival_time for req in self.waiting_queue)
+                        if self.current_time < next_arrival:
+                            self.current_time = next_arrival
+                    continue
                 
-                # Get next batch of requests
-                batch = sorted_queue[:batch_size]
+                # Step 2: Sort ready requests by arrival_time (FIFO)
+                sorted_ready = sorted(ready_requests, key=lambda r: r.arrival_time)
+                
+                # Step 3: Take min(batch_size, len(ready_requests)) for batch
+                actual_batch_size = min(batch_size, len(sorted_ready))
+                batch = sorted_ready[:actual_batch_size]
                 
                 # Remove batch from waiting queue
                 for req in batch:
                     self.waiting_queue.remove(req)
                 
-                # Adjust current_time to GPU availability
+                # Step 4: Adjust current_time to GPU availability
                 if self.current_time < gpu_available_time:
                     self.current_time = gpu_available_time
                 
-                # Advance time to the earliest arrival in this batch
-                # (simulates waiting for requests to arrive before processing)
-                earliest_arrival = min(req.arrival_time for req in batch)
-                if earliest_arrival > self.current_time:
-                    self.current_time = earliest_arrival
+                # Note: We don't advance current_time because all batch requests are ready
+                # (arrival_time <= current_time), so no waiting needed
                 
                 # Calculate batch timing
                 batch_result = self._run_batch_event(batch, gpu_available_time)
@@ -473,8 +479,9 @@ class KVCacheSimulator:
                     requests_processed += 1
                 
                 # Handle completions for batch
-                for req in batch:
-                    self._on_request_complete(req, batch_result)
+                for req_idx, req in enumerate(batch):
+                    result = batch_result.results[req_idx] if req_idx < len(batch_result.results) else batch_result.results[0]
+                    self._on_request_complete(req, batch_result, result)
             
             else:
                 # Single request mode (event-driven)
@@ -608,9 +615,14 @@ class KVCacheSimulator:
             print(f"\n[DEBUG _run_batch_event] batch_size={len(batch)} l1_tokens={match_results['total_l1_tokens']} l2_tokens={match_results['total_l2_tokens']}")
             for i, r in enumerate(match_results['results']):
                 print(f"  [DEBUG] req {batch[i].rid}: l1={r['l1_matched']} l2={r['l2_matched']} new={r['new_tokens']} total={r['total_tokens']}")
+            print(f"  [DEBUG] allocator before eviction: used={self.radix_tree.allocator.used()}, available={self.radix_tree.allocator.available()}")
 
         # Batch eviction
         self.scheduler.batch_evict_for_requests(batch, match_results['results'], self.current_time)
+
+        if DEBUG:
+            print(f"  [DEBUG] allocator after eviction: used={self.radix_tree.allocator.used()}, available={self.radix_tree.allocator.available()}")
+            print(f"  [DEBUG] radix tree nodes: {len(self.radix_tree.nodes)}")
 
         # Batch L2 loading
         l2_load_time, l2_hits = self.scheduler.batch_load_l2_to_l1(batch, match_results['results'])
@@ -625,7 +637,13 @@ class KVCacheSimulator:
         from .request import BatchResult as ReqBatchResult, ProcessResult
 
         results = []
-        for req in batch:
+        for req_idx, req in enumerate(batch):
+            # Get the updated match results from batch_evict_for_requests
+            # (which includes L2->L1 restoration)
+            batch_result = match_results['results'][req_idx]
+            l1_matched_from_batch = batch_result['l1_matched']
+            l2_matched_from_batch = batch_result['l2_matched']
+            
             # Directly call _process_request without time advancement
             ttl_sec = req.ttl_sec or (self.ttl_manager.default_ttl if self.ttl_manager else 5.0)
             tool_name = req.tool_name
@@ -633,11 +651,17 @@ class KVCacheSimulator:
             if self.ttl_manager:
                 self.ttl_manager.cleanup_expired(self.current_time)
 
-            process_result = self.scheduler._process_request(req, self.current_time, ttl_sec=ttl_sec, tool_name=tool_name)
+            # skip_eviction=True because eviction was already done by batch_evict_for_requests
+            # Pass l2_matched_override to handle L2 restoration properly
+            process_result = self.scheduler._process_request(
+                req, self.current_time, ttl_sec=ttl_sec, tool_name=tool_name,
+                skip_eviction=True, l2_matched_override=l2_matched_from_batch
+            )
 
-            # Determine hit type and set timing
+            # Determine hit type using the updated batch_result (which has L2->L1 restoration applied)
+            # Note: Stats are already updated by _update_batch_hit_stats in batch_evict_for_requests
             is_ttl_hit = (
-                process_result.hit and
+                l1_matched_from_batch > 0 and
                 req.is_tool_call and
                 self.ttl_manager and
                 self.ttl_manager.is_pinned(req.program_id, self.current_time)
@@ -649,24 +673,29 @@ class KVCacheSimulator:
 
             if is_ttl_hit:
                 hit_type = "TTL"
-                l1_tokens = process_result.matched_tokens
+                l1_tokens = l1_matched_from_batch
+                # Stats already updated by _update_batch_hit_stats, just recount as TTL
                 self.radix_tree.stats.ttl_hits += 1
-            elif process_result.l2_hit:
+                self.radix_tree.stats.l1_hits -= 1  # Correct the miscount
+            elif l2_matched_from_batch > 0:
+                # L2 data was restored to L1 during batch_evict_for_requests
+                # But we still report it as L2 hit for proper accounting
                 hit_type = "L2"
-                l2_tokens = process_result.l2_tokens
-                l1_tokens = 0
-                self.radix_tree.stats.l2_hits += 1
-            elif process_result.hit:
+                l2_tokens = l2_matched_from_batch
+                l1_tokens = l1_matched_from_batch
+            elif l1_matched_from_batch > 0:
                 hit_type = "L1"
-                l1_tokens = process_result.matched_tokens
-                self.radix_tree.stats.l1_hits += 1
+                l1_tokens = l1_matched_from_batch
             else:
                 hit_type = "L1+L2 Miss"
                 l1_tokens = 0
-                self.radix_tree.stats.cache_misses += 1
 
+            # Update process_result with values from batch_result (which has L2->L1 restoration)
+            process_result.matched_tokens = l1_matched_from_batch
+            process_result.new_tokens = batch_result['new_tokens']
+            
             # Get time breakdown
-            total_input_tokens = process_result.matched_tokens + process_result.new_tokens
+            total_input_tokens = l1_matched_from_batch + batch_result['new_tokens']
             time_breakdown = self.scheduler.timing.get_time_breakdown(
                 total_input_tokens=total_input_tokens,
                 output_tokens=req.output_len,
@@ -723,10 +752,15 @@ class KVCacheSimulator:
             results.append(process_result)
 
         # Calculate batch time (max of all request times = parallel execution)
+        # Add L2 load time for L2->L1 migration cost
         total_time = 0.0
         for r in results:
             if hasattr(r, 'inference_time'):
                 total_time = max(total_time, r.inference_time)
+        
+        # Add L2->L1 migration time to batch total
+        l2_load_seconds = l2_load_time / 1000.0 if l2_load_time else 0.0
+        total_time += l2_load_seconds
 
         return ReqBatchResult(
             results=results,
@@ -843,36 +877,29 @@ class KVCacheSimulator:
         if next_arrival > self.current_time:
             self.current_time = next_arrival
 
-    def _on_request_complete(self, req: Request, batch_result) -> None:
+    def _on_request_complete(self, req: Request, batch_result, result=None) -> None:
         """
         Handle request completion:
-        1. Pin the program if it's a tool call (TTL mechanism)
-        2. Record tool execution for adaptive TTL
-        3. Generate next turn request if available
+        1. Calculate adaptive TTL (using historical CDF only)
+        2. Pin the program if it's a tool call (TTL mechanism)
+        3. Record tool execution for adaptive TTL (for NEXT request's CDF)
+        4. Generate next turn request if available
+
+        IMPORTANT: record_tool_execution MUST come after calc_adaptive_ttl
+        to ensure TTL decisions use only historical data, not current request.
         """
         if not batch_result.results:
             return
 
-        result = batch_result.results[0]
+        # Use provided result or default to first result
+        if result is None:
+            result = batch_result.results[0]
 
-        # Calculate idle gap: time until next turn arrives
-        next_turn_index = req.turn_index + 1
-        idle_gap = 0.0
-        if next_turn_index <= self.program_max_turns.get(req.program_id, 0):
-            # Next turn arrives at current_time + tool_execution_time
-            idle_gap = self.tool_execution_time
-
-        # Record tool execution for adaptive TTL CDF calculation
-        if self.ttl_manager and req.tool_name:
-            self.ttl_manager.record_tool_execution(
-                program_id=req.program_id,
-                tool_name=req.tool_name,
-                duration=req.actual_tool_duration if req.actual_tool_duration else (req.ttl_sec or self.config.default_ttl),
-                idle_gap=idle_gap
-            )
-
-        # Calculate adaptive TTL if enabled
+        # Step 1: Calculate adaptive TTL if enabled
+        # This uses historical CDF, NOT including current request's duration
         ttl_sec = req.ttl_sec or self.config.default_ttl
+        strategy = 'disabled'  # Track actual strategy for prediction recording
+        
         if self.ttl_manager and self.config.enable_adaptive_ttl:
             # Calculate adaptive TTL using paper's utility model
             miss_tokens = result.new_tokens
@@ -883,7 +910,7 @@ class KVCacheSimulator:
             l2_enabled = self.config.l2_enabled
             l2_reload_penalty = getattr(self.config, 'l2_reload_penalty', 0.3)
 
-            adaptive_ttl, strategy = self.ttl_manager.calc_adaptive_ttl(
+            adaptive_ttl, strategy, cdf_samples = self.ttl_manager.calc_adaptive_ttl(
                 program_id=req.program_id,
                 tool_name=req.tool_name,
                 miss_tokens=miss_tokens,
@@ -896,6 +923,7 @@ class KVCacheSimulator:
             )
             ttl_sec = adaptive_ttl
 
+        # Step 2: Pin the program based on calculated TTL
         # Note: Pinning is now done immediately in scheduler._process_request
         # This only handles re-pinning for cache hits where the node wasn't pinned
         if self.ttl_manager and ttl_sec > 0:
@@ -918,33 +946,76 @@ class KVCacheSimulator:
                     self.scheduler.stats.ttl_pins += 1
             # For misses, the node was already pinned in scheduler._process_request
 
+        # Calculate idle gap for later use (time until next turn arrives)
+        next_turn_index = req.turn_index + 1
+        idle_gap = 0.0
+        if next_turn_index <= self.program_max_turns.get(req.program_id, 0):
+            actual_duration = req.actual_tool_duration if req.actual_tool_duration else self.tool_execution_time
+            idle_gap = actual_duration
+
+        # Calculate queueing delay (waiting time before execution started)
+        # Queueing delay = time from arrival to start of execution
+        queueing_delay = 0.0
+        if req.start_time is not None and req.arrival_time is not None:
+            queueing_delay = max(0.0, req.start_time - req.arrival_time)
+
         # Track pending turns to avoid duplicates
         if not hasattr(self, '_pending_turns'):
             self._pending_turns = set()
 
-        # Generate next turn request
+        # Step 3: Generate next turn request (MUST be before record_tool_execution)
+        # The next request needs correct arrival_time which uses actual_tool_duration
         if next_turn_index <= self.program_max_turns.get(req.program_id, 0):
             # Check for duplicate before adding
             next_rid = f"{req.program_id}_turn_{next_turn_index}"
-            if next_rid in self._pending_turns:
-                # Already pending, skip
-                return
+            if next_rid not in self._pending_turns:
+                # Find the next turn entry from entries_by_program
+                for entry in self.entries_by_program.get(req.program_id, []):
+                    if entry.turn_index == next_turn_index:
+                        next_req = self._entry_to_request(entry)
+                        # Next turn arrives at: finish_time + actual tool execution time
+                        actual_duration = req.actual_tool_duration if req.actual_tool_duration else self.tool_execution_time
+                        next_arrival_base = req.finish_time + actual_duration
+                        next_req.arrival_time = next_arrival_base
+                        next_req.program_arrival_time = req.program_arrival_time  # Keep original ordering
+                        # Set queue_start_time when request enters queue (for proper queue wait tracking)
+                        next_req.queue_start_time = next_arrival_base
+                        self.waiting_queue.append(next_req)
+                        self._pending_turns.add(next_rid)
+                        break
 
-            # Find the next turn entry from entries_by_program
-            for entry in self.entries_by_program.get(req.program_id, []):
-                if entry.turn_index == next_turn_index:
-                    next_req = self._entry_to_request(entry)
-                    # Next turn arrives at: finish_time + tool_execution_time
-                    # We use finish_time (req.finish_time) which is set by _record_request_completion
-                    # This is called BEFORE _on_request_complete, so finish_time is set
-                    next_arrival_base = req.finish_time + self.tool_execution_time
-                    next_req.arrival_time = next_arrival_base
-                    next_req.program_arrival_time = req.program_arrival_time  # Keep original ordering
-                    # Set queue_start_time when request enters queue (for proper queue wait tracking)
-                    next_req.queue_start_time = next_arrival_base
-                    self.waiting_queue.append(next_req)
-                    self._pending_turns.add(next_rid)
-                    break
+        # Step 4: Record tool execution for adaptive TTL CDF calculation
+        # IMPORTANT: This MUST be last, so CDF is updated AFTER TTL calculation
+        # The recorded duration will be used for the NEXT request's TTL decision
+        if self.ttl_manager and req.tool_name:
+            actual_dur = req.actual_tool_duration if req.actual_tool_duration else (req.ttl_sec or self.config.default_ttl)
+            self.ttl_manager.record_tool_execution(
+                program_id=req.program_id,
+                tool_name=req.tool_name,
+                duration=actual_dur,
+                idle_gap=idle_gap,
+                queueing_delay=queueing_delay
+            )
+            
+            # Step 5: Record TTL prediction vs actual for analysis
+            # Use cdf_samples from calc_adaptive_ttl return value (correct)
+            cache_hit = result.hit if result else False
+            
+            # Get memory pressure
+            capacity = self.radix_tree.allocator.capacity
+            memory_pressure = self.radix_tree.allocator.used() / max(capacity, 1) if capacity > 0 else 0.0
+            
+            self.ttl_manager.record_prediction(
+                program_id=req.program_id,
+                tool_name=req.tool_name,
+                predicted_ttl=ttl_sec,
+                actual_duration=actual_dur,
+                cdf_samples=cdf_samples,
+                strategy=strategy,  # Use actual strategy from calc_adaptive_ttl
+                cache_hit=cache_hit,
+                current_time=self.current_time,
+                memory_pressure=memory_pressure
+            )
 
     def _copy_stats(self) -> None:
         """Copy statistics from components to collector."""

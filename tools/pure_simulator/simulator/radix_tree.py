@@ -446,12 +446,13 @@ class RadixTree:
             if entry:
                 self.ttl_manager.unpin_program(node.program_id, current_time, node.node_id)
         
-        # Now evictable_size should be correctly updated by dec_lock_ref
         # Free the allocator space and remove from tree
         self.allocator.free(node.kv_indices)
         self._remove_node(node)
-        self.token_count -= len(node.key)
-        self.stats.tokens_evicted += len(node.key)
+        node_size = len(node.key)
+        self.token_count -= node_size
+        self.evictable_size -= node_size  # Track evictable size correctly
+        self.stats.tokens_evicted += node_size
     
     def _get_all_leaf_nodes(self) -> List["TreeNode"]:
         """Get all leaf nodes in the tree."""

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Generated Results
+results/*.json
+results/*.html
+results/*.png
+results/charts_latest/
+results/*_analysis/
+results/predictive_comparison/
+
+# Experiments
+experiments/*.json
+experiments/*/
+
+# Legacy sweep results
+sweep_results/
+sweep_poisson_results_*.json
+ttl_sweep_results.json
+
+# Temporary
+*.log
+*.tmp
